@@ -4,6 +4,7 @@ Pemakaian:
     python pipeline.py                              # kemarin (mode harian)
     python pipeline.py --date 2026-10-02            # satu hari tertentu
     python pipeline.py --backfill 2023-01-01 2026-10-03
+    python pipeline.py --date 2026-10-02 --sample 15  # lihat pesan mentah, tanpa menyimpan
 
 Environment variables:
     DISCORD_USER_TOKEN     token akun tumbal (simpan di .env / env var, JANGAN di-commit)
@@ -29,7 +30,7 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client
 
-from offer_parser import Offer, parse_message, summarize_day
+from offer_parser import Offer, mentions_tracked, parse_message, summarize_day
 
 load_dotenv()  # baca scraper/.env kalau ada
 
@@ -83,17 +84,38 @@ class DiscordClient:
             _time.sleep(DELAY)
 
 
-def fetch_day(dc: DiscordClient, channel_ids: list[int], day: date) -> list[Offer]:
+def iter_messages(dc: DiscordClient, channel_ids: list[int], day: date) -> Iterator[dict]:
     start = datetime.combine(day, time.min, tzinfo=TZ)
     end = start + timedelta(days=1)
-    offers: list[Offer] = []
     for cid in channel_ids:
         for m in dc.messages_between(cid, start, end):
             if m["author"].get("bot") or not m.get("content"):
                 continue
-            offers.extend(parse_message(m["content"], m["author"]["id"]))
+            yield m
         _time.sleep(DELAY)
+
+
+def fetch_day(dc: DiscordClient, channel_ids: list[int], day: date) -> list[Offer]:
+    offers: list[Offer] = []
+    for m in iter_messages(dc, channel_ids, day):
+        offers.extend(parse_message(m["content"], m["author"]["id"]))
     return offers  # data mentah hanya hidup di memori, per hari
+
+
+def show_sample(dc: DiscordClient, channel_ids: list[int], day: date, limit: int) -> None:
+    """Cetak pesan mentah + hasil parsing. Tidak menulis apa pun ke Supabase."""
+    shown = 0
+    for m in iter_messages(dc, channel_ids, day):
+        if not mentions_tracked(m["content"]):
+            continue
+        print("RAW   :", repr(m["content"]))
+        for o in parse_message(m["content"], m["author"]["id"]):
+            print(f"PARSED: {o.action} {o.item} = {o.price_wl / 10_000:.4f} BGL")
+        print("-" * 50)
+        shown += 1
+        if shown >= limit:
+            break
+    print(f"{shown} pesan ditampilkan (mode sample, tidak ada yang disimpan)")
 
 
 def daterange(start: date, end: date):
@@ -107,6 +129,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", type=date.fromisoformat)
     ap.add_argument("--backfill", nargs=2, type=date.fromisoformat, metavar=("FROM", "TO"))
+    ap.add_argument("--sample", type=int, metavar="N",
+                    help="tampilkan N pesan mentah + hasil parsing, tanpa menyimpan ke Supabase")
     args = ap.parse_args()
 
     if args.backfill:
@@ -116,9 +140,14 @@ def main():
     else:
         days = [datetime.now(TZ).date() - timedelta(days=1)]  # hari yang sudah lengkap
 
-    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
     dc = DiscordClient(os.environ["DISCORD_USER_TOKEN"])
     channel_ids = [int(c) for c in os.environ["DISCORD_CHANNEL_IDS"].split(",")]
+
+    if args.sample:
+        show_sample(dc, channel_ids, days[0], args.sample)
+        return
+
+    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
     for day in days:
         offers = fetch_day(dc, channel_ids, day)

@@ -1,4 +1,8 @@
-"""Module 1: parser pesan Discord Growtopia + penghitung ringkasan harian."""
+"""Module 1: parser pesan Discord Growtopia + penghitung ringkasan harian.
+
+Hanya item di TRACKED_ITEMS yang diproses. Pesan dibaca per baris, jadi satu
+pesan berisi beberapa baris "Sell ..." dihitung sebagai beberapa penawaran.
+"""
 from __future__ import annotations
 
 import re
@@ -6,35 +10,63 @@ from collections import defaultdict
 from dataclasses import dataclass
 from statistics import mean, median, quantiles
 
-# Konversi lock ke WL. Semua harga dinormalisasi ke WL dulu (integer-friendly),
-# lalu diubah ke BGL saat diringkas.
+# ---------------------------------------------------------------- konfigurasi
+
+# 1 BGL = 100 DL = 10.000 WL. Semua harga dihitung dalam WL dulu.
 WL_PER_UNIT = {"wl": 1, "dl": 100, "bgl": 10_000}
 
-ACTIONS = {
-    "sell": "sell", "selling": "sell", "wts": "sell",
-    "buy": "buy", "buying": "buy", "wtb": "buy",
+# Item yang dipantau: nama di database -> alias yang dipakai orang di chat.
+# Tambah item baru di sini, mis. "magplant": ["magplant", "mag"].
+TRACKED_ITEMS: dict[str, list[str]] = {
+    "growscan": ["growscan", "gscan", "gs"],
 }
 
-# Alias nama item -> nama kanonik. Isi sesuai kebutuhan, contoh:
-# ALIASES = {"ghc": "ghc", "magplant": "magplant 5000"}
-ALIASES: dict[str, str] = {}
+# Angka TANPA satuan (mis. "growscan 550"): >= batas ini dianggap DL,
+# di bawahnya dianggap BGL. Sesuaikan per item bila harganya jauh berbeda.
+BARE_DL_MIN: dict[str, float] = {"growscan": 50}
+DEFAULT_BARE_DL_MIN = 50
 
-OFFER_RE = re.compile(
-    r"""
-    (?<![a-z0-9])
-    (?P<action>sell|selling|wts|buy|buying|wtb)\s+
-    (?P<item>[a-z][a-z0-9'\- ]{1,40}?)\s+
-    (?P<price>\d+(?:[.,]\d+)?)\s*(?P<unit>bgl|dl|wl)s?\b
-    (?:\s+(?:at|in|@)\s+(?P<world>[a-z0-9]{1,24}))?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
+# Emoji custom Discord muncul di teks mentah sebagai <:nama:id>.
+# Dicocokkan lewat nama (huruf kecil, tanpa underscore) atau lewat id.
+# Kalau emoji tidak dikenali, angkanya diperlakukan sebagai "tanpa satuan".
+EMOJI_NAME_UNITS = {
+    "bgl": "bgl", "bluegemlock": "bgl",
+    "dl": "dl", "diamondlock": "dl",
+    "wl": "wl", "worldlock": "wl",
+}
+EMOJI_ID_UNITS: dict[str, str] = {}  # isi setelah lihat output --sample, mis. {"123456789": "bgl"}
+
+# Bagian nama item yang berupa angka (bukan harga), mis. "Growscan 9000".
+NOISE_PATTERNS = [
+    re.compile(r"(?<![a-z0-9])(growscan|gscan)\s*9000(?![a-z0-9])", re.I),
+]
 
 MIN_POSTS_TO_STORE = 3   # hari dengan sampel < 3 postingan tidak disimpan
 IQR_K = 1.5
 # False = semua postingan dihitung, termasuk harga yang sama berulang
 # (median yang menentukan harga akhir). True = satu penulis + harga sama = 1 suara.
 DEDUPE = False
+
+# ------------------------------------------------------------------ regex
+
+ACTIONS = {
+    "sell": "sell", "selling": "sell", "wts": "sell",
+    "buy": "buy", "buying": "buy", "wtb": "buy",
+}
+ACTION_RE = re.compile(r"(?<![a-z0-9])(sell|selling|wts|buy|buying|wtb)(?![a-z0-9])", re.I)
+EMOJI_RE = re.compile(r"<a?:(\w+):(\d+)>")
+
+ALIAS_TO_ITEM = {a.lower(): item for item, aliases in TRACKED_ITEMS.items() for a in aliases}
+ALIAS_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + "|".join(re.escape(a) for a in sorted(ALIAS_TO_ITEM, key=len, reverse=True))
+    + r")(?![a-z0-9])",
+    re.I,
+)
+PRICE_RE = re.compile(
+    r"(?<![\w.,])(?P<num>\d+(?:[.,]\d{1,2})?)\s*(?:(?P<unit>bgl|dl|wl)s?)?(?![a-z0-9])",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -45,29 +77,54 @@ class Offer:
     author: str
 
 
-def normalize_item(raw: str) -> str:
-    name = re.sub(r"\s+", " ", raw.strip().lower())
-    return ALIASES.get(name, name)
+def mentions_tracked(text: str) -> bool:
+    return bool(ALIAS_RE.search(text))
+
+
+def _normalize(text: str) -> str:
+    def emoji(m: re.Match) -> str:
+        unit = EMOJI_ID_UNITS.get(m[2]) or EMOJI_NAME_UNITS.get(m[1].lower().replace("_", ""))
+        return f" {unit} " if unit else " "
+
+    text = EMOJI_RE.sub(emoji, text)  # juga membuang id emoji agar tidak terbaca sebagai harga
+    for pat in NOISE_PATTERNS:
+        text = pat.sub(r"\1", text)
+    return text
 
 
 def parse_message(text: str, author: str) -> list[Offer]:
-    """Satu pesan bisa memuat beberapa penawaran, jadi pakai finditer."""
+    text = _normalize(text)
+    msg_action = ACTION_RE.search(text)
     offers: list[Offer] = []
-    for m in OFFER_RE.finditer(text):
-        price = float(m["price"].replace(",", "."))
-        price_wl = price * WL_PER_UNIT[m["unit"].lower()]
+
+    for line in text.splitlines():
+        aliases = list(ALIAS_RE.finditer(line))
+        if not aliases:
+            continue
+        last = aliases[-1]  # "GROWSCAN GS GSCAN 6" -> harga dicari setelah alias terakhir
+
+        act = ACTION_RE.search(line) or msg_action
+        if not act:
+            continue  # tanpa buy/sell kemungkinan bukan promosi (mis. pertanyaan harga)
+
+        price = PRICE_RE.search(line, last.end())
+        if not price:
+            continue
+
+        item = ALIAS_TO_ITEM[last[0].lower()]
+        num = float(price["num"].replace(",", "."))
+        unit = (price["unit"] or "").lower()
+        if not unit:
+            unit = "dl" if num >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
+
+        price_wl = num * WL_PER_UNIT[unit]
         if price_wl <= 0:
             continue
-        offers.append(
-            Offer(
-                item=normalize_item(m["item"]),
-                action=ACTIONS[m["action"].lower()],
-                price_wl=price_wl,
-                author=author,
-            )
-        )
+        offers.append(Offer(item, ACTIONS[act[1].lower()], price_wl, author))
     return offers
 
+
+# -------------------------------------------------------------- ringkasan
 
 def iqr_filter(prices: list[float], k: float = IQR_K) -> list[float]:
     """Buang outlier (harga troll/spam) dengan metode IQR."""
@@ -117,14 +174,17 @@ def summarize_day(offers: list[Offer], day: str, actions: set[str] | None = None
 
 
 if __name__ == "__main__":
+    # Contoh dari screenshot channel buy-sell-rare-items
     samples = [
-        ("sell ghc 30bgl at MUKEL", "a"),
-        ("buy bgl 20wl at WORLD", "b"),
-        ("SELL GHC 31 bgl at ABC | buy rayman 4.5bgl in XYZ", "c"),
-        ("sell ghc 32bgl", "d"),
-        ("sell ghc 30bgl at MUKEL", "a"),      # harga sama diulang: tetap dihitung
-        ("sell lock 150dl at X | buy lock 45wl at Y", "f"),
-        ("sell ghc 9999bgl at TROLL", "e"),    # troll
+        ("Sell GROWSCAN GS GSCAN 6 <:bgl:111> NO LESS\nSell GROWSCAN GS GSCAN 6 <:bgl:111> NO LESS", "wasup"),
+        ("BUY GROWSCAN GS GSCAN 6 💎", "ky"),
+        ("Buy Growscan 500 <:dl:222>", "user310"),
+        ("Buy Magplant 16 <:bgl:111>\nBuy Growscan / gs 550 <:dl:222>\nBuy Swordfish Sword / sfs 2.5 <:bgl:111>", "nox"),
+        ("buy growscan / gs / gscan 550\ndm me", "nihun"),
+        ("Sell growscan 590 <:dl:222> dm me\n\nSell growscan 590 <:dl:222> dm me", "kolibri"),
+        ("sell growscan 9000 6bgl", "x"),            # "9000" = nama item, bukan harga
+        ("how much is growscan 6?", "y"),            # tanpa buy/sell: diabaikan
+        ("sell growscan 9999bgl", "troll"),
     ]
     offers = [o for text, a in samples for o in parse_message(text, a)]
     for o in offers:
