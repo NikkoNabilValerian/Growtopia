@@ -142,36 +142,51 @@ def iqr_filter(prices: list[float], k: float = IQR_K) -> list[float]:
     return [p for p in prices if lo <= p <= hi]
 
 
-def summarize_day(offers: list[Offer], day: str, actions: set[str] | None = None) -> list[dict]:
+def _segment(prices: list[float]) -> tuple[float | None, int]:
+    """(median setelah filter IQR, jumlah postingan). Median None bila sampel kurang."""
+    if len(prices) < MIN_POSTS_TO_STORE:
+        return None, len(prices)
+    clean = iqr_filter(prices)
+    return (round(median(clean), 4) if clean else None), len(prices)
+
+
+def summarize_day(offers: list[Offer], day: str) -> list[dict]:
     """Ubah semua penawaran satu hari menjadi 1 baris ringkasan per item.
 
-    actions: batasi ke {"sell"} atau {"buy"}; None = gabungan keduanya
-    (sesuai skema tabel yang hanya punya satu baris per item per hari).
+    Kolom gabungan (avg/median/min/max/total_volume) memakai buy + sell.
+    buy_median / sell_median dihitung terpisah; None bila postingan < MIN_POSTS_TO_STORE.
     """
-    selected = [o for o in offers if actions is None or o.action in actions]
     if DEDUPE:
-        selected = list({(o.author, o.item, o.action, o.price_wl): o for o in selected}.values())
+        offers = list({(o.author, o.item, o.action, o.price_wl): o for o in offers}.values())
 
-    by_item: dict[str, list[float]] = defaultdict(list)
-    for o in selected:
-        by_item[o.item].append(o.price_wl / 10_000)  # WL -> BGL
+    groups: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"all": [], "buy": [], "sell": []})
+    for o in offers:
+        bgl = o.price_wl / 10_000  # WL -> BGL
+        groups[o.item]["all"].append(bgl)
+        groups[o.item][o.action].append(bgl)
 
     rows = []
-    for item, prices in by_item.items():
-        if len(prices) < MIN_POSTS_TO_STORE:
+    for item, g in groups.items():
+        if len(g["all"]) < MIN_POSTS_TO_STORE:
             continue
-        clean = iqr_filter(prices)
+        clean = iqr_filter(g["all"])
         if not clean:
             continue
+        buy_median, buy_volume = _segment(g["buy"])
+        sell_median, sell_volume = _segment(g["sell"])
         rows.append(
             {
                 "item_name": item,
                 "date": day,
                 "avg_price": round(mean(clean), 4),
-                "median_price": round(median(clean), 4),
+                "median_price": round(median(clean), 4),   # gabungan
                 "min_price": round(min(clean), 4),
                 "max_price": round(max(clean), 4),
-                "total_volume": len(prices),  # sebelum filter IQR
+                "total_volume": len(g["all"]),              # sebelum filter IQR
+                "buy_median": buy_median,
+                "sell_median": sell_median,
+                "buy_volume": buy_volume,
+                "sell_volume": sell_volume,
             }
         )
     return rows

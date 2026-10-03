@@ -2,9 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  Area,
   CartesianGrid,
   ComposedChart,
+  Legend,
   Line,
   ResponsiveContainer,
   Tooltip,
@@ -26,18 +26,30 @@ import { supabase } from "@/lib/supabase";
 type Range = "7D" | "30D" | "1Y" | "ALL";
 const RANGE_DAYS: Record<Range, number | null> = { "7D": 7, "30D": 30, "1Y": 365, ALL: null };
 
+type SeriesKey = "sell" | "buy" | "combined";
+
 type Point = {
   date: string;
-  median: number;
-  avg: number;
+  sell: number | null;     // median harga penjual
+  buy: number | null;      // median harga pembeli
+  combined: number;        // median gabungan
+  sellVol: number;
+  buyVol: number;
+  volume: number;
   min: number;
   max: number;
-  volume: number;
-  band: [number, number]; // rentang min-max untuk area
 };
 
+// Biru vs oranye tetap mudah dibedakan untuk buta warna; gabungan memakai warna teks.
+const SERIES: { key: SeriesKey; label: string; color: string; dashed?: boolean }[] = [
+  { key: "sell", label: "Penjual (sell)", color: "#f97316" },
+  { key: "buy", label: "Pembeli (buy)", color: "#3b82f6" },
+  { key: "combined", label: "Gabungan", color: "currentColor", dashed: true },
+];
+
 // Harga disimpan dalam BGL. Di bawah 1 BGL tampilkan dalam WL / DL agar terbaca.
-function fmtPrice(bgl: number): string {
+function fmtPrice(bgl: number | null): string {
+  if (bgl == null) return "–";
   if (bgl >= 1) return `${+bgl.toFixed(2)} BGL`;
   const wl = bgl * 10_000;
   return wl >= 100 ? `${+(wl / 100).toFixed(1)} DL` : `${Math.round(wl)} WL`;
@@ -63,7 +75,9 @@ async function fetchPrices(item: string, range: Range): Promise<Point[]> {
   for (let offset = 0; ; offset += PAGE) {
     let q = supabase
       .from("daily_item_prices")
-      .select("date, median_price, avg_price, min_price, max_price, total_volume")
+      .select(
+        "date, median_price, min_price, max_price, total_volume, buy_median, sell_median, buy_volume, sell_volume"
+      )
       .eq("item_name", item)
       .order("date", { ascending: true })
       .range(offset, offset + PAGE - 1);
@@ -74,15 +88,27 @@ async function fetchPrices(item: string, range: Range): Promise<Point[]> {
     if (data.length < PAGE) break;
   }
 
+  const num = (v: unknown) => (v == null ? null : Number(v));
   return rows.map((r) => ({
     date: r.date,
-    median: Number(r.median_price),
-    avg: Number(r.avg_price),
+    sell: num(r.sell_median),
+    buy: num(r.buy_median),
+    combined: Number(r.median_price),
+    sellVol: r.sell_volume ?? 0,
+    buyVol: r.buy_volume ?? 0,
+    volume: r.total_volume,
     min: Number(r.min_price),
     max: Number(r.max_price),
-    volume: r.total_volume,
-    band: [Number(r.min_price), Number(r.max_price)],
   }));
+}
+
+// Harga terakhir + perubahan % dari titik pertama yang punya data.
+function trend(data: Point[], key: SeriesKey) {
+  const vals = data.map((d) => d[key]).filter((v): v is number => v != null);
+  if (!vals.length) return null;
+  const first = vals[0];
+  const last = vals[vals.length - 1];
+  return { last, change: vals.length > 1 ? ((last - first) / first) * 100 : null };
 }
 
 function ChartTooltip({ active, payload }: any) {
@@ -91,11 +117,22 @@ function ChartTooltip({ active, payload }: any) {
   return (
     <div className="rounded-md border bg-background px-3 py-2 text-sm shadow-sm">
       <div className="font-medium">{fmtDate(p.date, true)}</div>
-      <div className="mt-1 grid grid-cols-[auto_auto] gap-x-4 text-muted-foreground">
-        <span>Median</span><span className="text-right text-foreground">{fmtPrice(p.median)}</span>
-        <span>Rata-rata</span><span className="text-right">{fmtPrice(p.avg)}</span>
-        <span>Rentang</span><span className="text-right">{fmtPrice(p.min)} – {fmtPrice(p.max)}</span>
-        <span>Postingan</span><span className="text-right">{p.volume}</span>
+      <div className="mt-1 grid grid-cols-[auto_auto_auto] gap-x-4 text-muted-foreground">
+        {SERIES.map((s) => (
+          <div key={s.key} className="contents">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: s.color }} />
+              {s.label}
+            </span>
+            <span className="text-right text-foreground">{fmtPrice(p[s.key])}</span>
+            <span className="text-right">
+              {s.key === "sell" ? p.sellVol : s.key === "buy" ? p.buyVol : p.volume} post
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 text-xs text-muted-foreground">
+        Rentang gabungan {fmtPrice(p.min)} – {fmtPrice(p.max)}
       </div>
     </div>
   );
@@ -137,43 +174,26 @@ export default function PriceChart() {
     };
   }, [item, range]);
 
-  const summary = useMemo(() => {
-    if (data.length < 2) return null;
-    const first = data[0].median;
-    const last = data[data.length - 1].median;
-    return { last, change: ((last - first) / first) * 100 };
-  }, [data]);
+  const stats = useMemo(
+    () => SERIES.map((s) => ({ ...s, t: trend(data, s.key) })),
+    [data]
+  );
 
   return (
-    <section className="w-full max-w-4xl space-y-4">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <Select value={item} onValueChange={setItem} disabled={!items.length}>
-            <SelectTrigger className="w-52 uppercase">
-              <SelectValue placeholder="Pilih item" />
-            </SelectTrigger>
-            <SelectContent>
-              {items.map((name) => (
-                <SelectItem key={name} value={name} className="uppercase">
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {summary && (
-            <p className="mt-3 text-3xl font-semibold tabular-nums">
-              {fmtPrice(summary.last)}
-              <span
-                className={`ml-3 text-base font-normal ${
-                  summary.change >= 0 ? "text-emerald-600" : "text-red-600"
-                }`}
-              >
-                {summary.change >= 0 ? "+" : ""}
-                {summary.change.toFixed(1)}% dalam {range}
-              </span>
-            </p>
-          )}
-        </div>
+    <section className="w-full max-w-4xl space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <Select value={item} onValueChange={setItem} disabled={!items.length}>
+          <SelectTrigger className="w-52 uppercase">
+            <SelectValue placeholder="Pilih item" />
+          </SelectTrigger>
+          <SelectContent>
+            {items.map((name) => (
+              <SelectItem key={name} value={name} className="uppercase">
+                {name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
 
         <ToggleGroup
           type="single"
@@ -189,7 +209,33 @@ export default function PriceChart() {
         </ToggleGroup>
       </div>
 
-      <div className="h-[380px] w-full text-primary">
+      {data.length > 0 && !loading && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          {stats.map((s) => (
+            <div key={s.key}>
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span className="inline-block h-2 w-2 rounded-full" style={{ background: s.color }} />
+                {s.label}
+              </div>
+              <div className="text-2xl font-semibold tabular-nums">
+                {s.t ? fmtPrice(s.t.last) : "–"}
+              </div>
+              {s.t?.change != null && (
+                <div
+                  className={`text-sm tabular-nums ${
+                    s.t.change >= 0 ? "text-emerald-600" : "text-red-600"
+                  }`}
+                >
+                  {s.t.change >= 0 ? "+" : ""}
+                  {s.t.change.toFixed(1)}% dalam {range}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="h-[380px] w-full text-foreground">
         {error ? (
           <p className="grid h-full place-items-center text-sm text-red-600">
             Data tidak bisa dimuat: {error}
@@ -223,22 +269,21 @@ export default function PriceChart() {
                 label={{ value: "BGL", angle: -90, position: "insideLeft", fontSize: 12 }}
               />
               <Tooltip content={<ChartTooltip />} />
-              {/* Area tipis = rentang harga terendah-tertinggi hari itu */}
-              <Area
-                dataKey="band"
-                stroke="none"
-                fill="currentColor"
-                fillOpacity={0.12}
-                isAnimationActive={false}
-              />
-              <Line
-                dataKey="median"
-                stroke="currentColor"
-                strokeWidth={2}
-                dot={data.length <= 31}
-                activeDot={{ r: 4 }}
-                isAnimationActive={false}
-              />
+              <Legend verticalAlign="top" height={28} iconType="plainline" wrapperStyle={{ fontSize: 12 }} />
+              {SERIES.map((s) => (
+                <Line
+                  key={s.key}
+                  name={s.label}
+                  dataKey={s.key}
+                  stroke={s.color}
+                  strokeWidth={s.dashed ? 1.5 : 2}
+                  strokeDasharray={s.dashed ? "5 4" : undefined}
+                  connectNulls
+                  dot={data.length <= 31}
+                  activeDot={{ r: 4 }}
+                  isAnimationActive={false}
+                />
+              ))}
             </ComposedChart>
           </ResponsiveContainer>
         )}
