@@ -34,7 +34,11 @@ EMOJI_NAME_UNITS = {
     "dl": "dl", "diamondlock": "dl",
     "wl": "wl", "worldlock": "wl",
 }
-EMOJI_ID_UNITS: dict[str, str] = {}  # isi setelah lihat output --sample, mis. {"123456789": "bgl"}
+EMOJI_ID_UNITS: dict[str, str] = {
+    "880251420413161533": "bgl",
+    "880251434380165130": "dl",
+    "880251447470596157": "wl",
+}
 
 # Bagian nama item yang berupa angka (bukan harga), mis. "Growscan 9000".
 NOISE_PATTERNS = [
