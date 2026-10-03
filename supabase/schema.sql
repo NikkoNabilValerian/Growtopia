@@ -5,15 +5,16 @@ CREATE TABLE IF NOT EXISTS daily_item_prices (
     id           BIGSERIAL PRIMARY KEY,
     item_name    VARCHAR(100)   NOT NULL,
     date         DATE           NOT NULL,
-    -- Gabungan buy + sell
+    -- Harga median (utama untuk chart): gabungan, lalu per sisi
+    median_price NUMERIC(14, 4) NOT NULL,   -- gabungan buy + sell
+    buy_median   NUMERIC(14, 4),            -- NULL = postingan hari itu terlalu sedikit
+    sell_median  NUMERIC(14, 4),
+    -- Statistik pendukung (gabungan)
     avg_price    NUMERIC(14, 4) NOT NULL,
-    median_price NUMERIC(14, 4) NOT NULL,
     min_price    NUMERIC(14, 4) NOT NULL,
     max_price    NUMERIC(14, 4) NOT NULL,
+    -- Jumlah postingan yang terekam
     total_volume INT            NOT NULL,
-    -- Dipisah per sisi. NULL = postingan hari itu terlalu sedikit.
-    buy_median   NUMERIC(14, 4),
-    sell_median  NUMERIC(14, 4),
     buy_volume   INT            NOT NULL DEFAULT 0,
     sell_volume  INT            NOT NULL DEFAULT 0,
     created_at   TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -41,14 +42,3 @@ CREATE POLICY "public read" ON daily_item_prices
     FOR SELECT TO anon USING (true);
 
 GRANT SELECT ON item_list TO anon;
-
--- ============================================================
--- MIGRASI untuk database yang sudah dibuat dengan versi lama:
--- jalankan HANYA blok ini di SQL Editor (tidak perlu menjalankan ulang yang di atas).
---
--- ALTER TABLE daily_item_prices
---   ADD COLUMN IF NOT EXISTS buy_median  NUMERIC(14, 4),
---   ADD COLUMN IF NOT EXISTS sell_median NUMERIC(14, 4),
---   ADD COLUMN IF NOT EXISTS buy_volume  INT NOT NULL DEFAULT 0,
---   ADD COLUMN IF NOT EXISTS sell_volume INT NOT NULL DEFAULT 0;
--- ============================================================
