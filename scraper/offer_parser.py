@@ -2,9 +2,15 @@
 
 Hanya item di TRACKED_ITEMS yang diproses. Pesan dibaca per baris, jadi satu
 pesan berisi beberapa baris "Sell ..." dihitung sebagai beberapa penawaran.
+
+Satuan harga (WL / DL / BGL) TIDAK diputuskan saat parsing. Parser hanya mencatat
+angka mentah + satuan eksplisit (kalau ada). Satuan untuk angka tanpa satuan
+("growscan 2720") ditentukan di resolve_offers() berdasarkan level harga hari itu
+(anchor), karena skala harga berubah drastis dari tahun ke tahun.
 """
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -20,11 +26,6 @@ WL_PER_UNIT = {"wl": 1, "dl": 100, "bgl": 10_000}
 TRACKED_ITEMS: dict[str, list[str]] = {
     "growscan": ["growscan", "gscan", "gs"],
 }
-
-# Angka TANPA satuan (mis. "growscan 550"): >= batas ini dianggap DL,
-# di bawahnya dianggap BGL. Sesuaikan per item bila harganya jauh berbeda.
-BARE_DL_MIN: dict[str, float] = {"growscan": 50}
-DEFAULT_BARE_DL_MIN = 50
 
 # Emoji custom Discord muncul di teks mentah sebagai <:nama:id>.
 # Dicocokkan lewat nama (huruf kecil, tanpa underscore) atau lewat id.
@@ -45,7 +46,21 @@ NOISE_PATTERNS = [
     re.compile(r"(?<![a-z0-9])(growscan|gscan)\s*9000(?![a-z0-9])", re.I),
 ]
 
-MIN_POSTS_TO_STORE = 3   # hari dengan sampel < 3 postingan tidak disimpan
+# --- Penentuan satuan untuk angka tanpa satuan -------------------------------
+# Anchor = perkiraan level harga (dalam WL) pada hari itu. Sumbernya (berurutan):
+#   1. harga tersimpan terdekat di database (diberikan oleh pipeline),
+#   2. median penawaran dengan satuan eksplisit pada hari itu (min. 3 buah),
+#   3. aturan statis di bawah (hanya jika tidak ada anchor sama sekali).
+# Angka tanpa satuan dijadikan WL / DL / BGL, mana yang paling dekat dengan anchor.
+MIN_EXPLICIT_FOR_ANCHOR = 3
+# Penawaran yang harganya lebih dari N kali lipat / kurang dari 1/N dari anchor
+# dibuang (mis. "84bgl" saat harga sebenarnya 84 DL). Berlaku juga untuk satuan eksplisit.
+ANCHOR_TOLERANCE = 5.0
+# Aturan statis cadangan: angka tanpa satuan >= batas ini dianggap DL, selain itu BGL.
+BARE_DL_MIN: dict[str, float] = {"growscan": 50}
+DEFAULT_BARE_DL_MIN = 50
+
+MIN_POSTS_TO_STORE = 3   # hari/sisi dengan sampel < 3 postingan tidak disimpan
 IQR_K = 1.5
 # False = semua postingan dihitung, termasuk harga yang sama berulang
 # (median yang menentukan harga akhir). True = satu penulis + harga sama = 1 suara.
@@ -76,9 +91,17 @@ PRICE_RE = re.compile(
 @dataclass(frozen=True)
 class Offer:
     item: str
-    action: str       # "buy" | "sell"
-    price_wl: float
+    action: str            # "buy" | "sell"
+    value: float           # angka mentah seperti yang diketik
+    unit: str | None       # "wl" | "dl" | "bgl" | None (tanpa satuan)
     author: str
+
+
+@dataclass(frozen=True)
+class Resolved:
+    offer: Offer
+    price_wl: float | None  # None = dibuang
+    how: str                # eksplisit | bare->wl | bare->dl | bare->bgl | bare-statis | dibuang
 
 
 def mentions_tracked(text: str) -> bool:
@@ -115,17 +138,60 @@ def parse_message(text: str, author: str) -> list[Offer]:
         if not price:
             continue
 
-        item = ALIAS_TO_ITEM[last[0].lower()]
-        num = float(price["num"].replace(",", "."))
-        unit = (price["unit"] or "").lower()
-        if not unit:
-            unit = "dl" if num >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
-
-        price_wl = num * WL_PER_UNIT[unit]
-        if price_wl <= 0:
+        value = float(price["num"].replace(",", "."))
+        if value <= 0:
             continue
-        offers.append(Offer(item, ACTIONS[act[1].lower()], price_wl, author))
+        offers.append(
+            Offer(
+                item=ALIAS_TO_ITEM[last[0].lower()],
+                action=ACTIONS[act[1].lower()],
+                value=value,
+                unit=(price["unit"] or "").lower() or None,
+                author=author,
+            )
+        )
     return offers
+
+
+# ------------------------------------------------------- penentuan satuan
+
+def _log_dist(a: float, b: float) -> float:
+    return abs(math.log10(a / b))
+
+
+def resolve_offers(offers: list[Offer], anchors: dict[str, float | None] | None = None) -> list[Resolved]:
+    """Ubah angka mentah menjadi harga dalam WL.
+
+    anchors: {item: level harga dalam WL} dari harga tersimpan terdekat (boleh kosong).
+    """
+    anchors = anchors or {}
+    by_item: dict[str, list[Offer]] = defaultdict(list)
+    for o in offers:
+        by_item[o.item].append(o)
+
+    out: list[Resolved] = []
+    for item, offs in by_item.items():
+        anchor = anchors.get(item)
+        if not anchor:
+            explicit = [o.value * WL_PER_UNIT[o.unit] for o in offs if o.unit]
+            if len(explicit) >= MIN_EXPLICIT_FOR_ANCHOR:
+                anchor = median(explicit)
+
+        for o in offs:
+            if o.unit:
+                wl, how = o.value * WL_PER_UNIT[o.unit], "eksplisit"
+            elif anchor:
+                unit = min(WL_PER_UNIT, key=lambda u: _log_dist(o.value * WL_PER_UNIT[u], anchor))
+                wl, how = o.value * WL_PER_UNIT[unit], f"bare->{unit}"
+            else:
+                unit = "dl" if o.value >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
+                wl, how = o.value * WL_PER_UNIT[unit], "bare-statis"
+
+            if anchor and _log_dist(wl, anchor) > math.log10(ANCHOR_TOLERANCE):
+                out.append(Resolved(o, None, "dibuang"))
+                continue
+            out.append(Resolved(o, wl, how))
+    return out
 
 
 # -------------------------------------------------------------- ringkasan
@@ -150,20 +216,30 @@ def _segment(prices: list[float]) -> tuple[float | None, int]:
     return (round(median(clean), 4) if clean else None), len(prices)
 
 
-def summarize_day(offers: list[Offer], day: str) -> list[dict]:
+def summarize_day(
+    offers: list[Offer], day: str, anchors: dict[str, float | None] | None = None
+) -> list[dict]:
     """Ubah semua penawaran satu hari menjadi 1 baris ringkasan per item.
 
     Kolom gabungan (avg/median/min/max/total_volume) memakai buy + sell.
     buy_median / sell_median dihitung terpisah; None bila postingan < MIN_POSTS_TO_STORE.
+    Harga disimpan dalam BGL.
     """
+    resolved = [r for r in resolve_offers(offers, anchors) if r.price_wl is not None]
     if DEDUPE:
-        offers = list({(o.author, o.item, o.action, o.price_wl): o for o in offers}.values())
+        seen, kept = set(), []
+        for r in resolved:
+            key = (r.offer.author, r.offer.item, r.offer.action, r.price_wl)
+            if key not in seen:
+                seen.add(key)
+                kept.append(r)
+        resolved = kept
 
     groups: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"all": [], "buy": [], "sell": []})
-    for o in offers:
-        bgl = o.price_wl / 10_000  # WL -> BGL
-        groups[o.item]["all"].append(bgl)
-        groups[o.item][o.action].append(bgl)
+    for r in resolved:
+        bgl = r.price_wl / 10_000  # WL -> BGL
+        groups[r.offer.item]["all"].append(bgl)
+        groups[r.offer.item][r.offer.action].append(bgl)
 
     rows = []
     for item, g in groups.items():
@@ -193,19 +269,23 @@ def summarize_day(offers: list[Offer], day: str) -> list[dict]:
 
 
 if __name__ == "__main__":
-    # Contoh dari screenshot channel buy-sell-rare-items
-    samples = [
-        ("Sell GROWSCAN GS GSCAN 6 <:bgl:111> NO LESS\nSell GROWSCAN GS GSCAN 6 <:bgl:111> NO LESS", "wasup"),
-        ("BUY GROWSCAN GS GSCAN 6 💎", "ky"),
-        ("Buy Growscan 500 <:dl:222>", "user310"),
-        ("Buy Magplant 16 <:bgl:111>\nBuy Growscan / gs 550 <:dl:222>\nBuy Swordfish Sword / sfs 2.5 <:bgl:111>", "nox"),
-        ("buy growscan / gs / gscan 550\ndm me", "nihun"),
-        ("Sell growscan 590 <:dl:222> dm me\n\nSell growscan 590 <:dl:222> dm me", "kolibri"),
-        ("sell growscan 9000 6bgl", "x"),            # "9000" = nama item, bukan harga
-        ("how much is growscan 6?", "y"),            # tanpa buy/sell: diabaikan
-        ("sell growscan 9999bgl", "troll"),
-    ]
-    offers = [o for text, a in samples for o in parse_message(text, a)]
-    for o in offers:
-        print(o)
-    print(summarize_day(offers, "2026-10-02"))
+    def show(title, texts, anchor_bgl=None):
+        offers = [o for i, t in enumerate(texts) for o in parse_message(t, str(i))]
+        anchors = {"growscan": anchor_bgl * 10_000} if anchor_bgl else None
+        print(f"\n== {title} (anchor: {anchor_bgl} BGL)" if anchor_bgl else f"\n== {title} (tanpa anchor)")
+        for r in resolve_offers(offers, anchors):
+            o = r.offer
+            price = f"{r.price_wl / 10_000:.4f} BGL" if r.price_wl is not None else "-"
+            print(f"  {o.action:4} {o.value:g} {o.unit or '(bare)':6} -> {price:>12}  [{r.how}]")
+        print("  ringkasan:", [(x["median_price"], x["buy_median"], x["sell_median"]) for x in summarize_day(offers, "2023-04-20", anchors)])
+
+    # Era WL: orang menulis "2720" artinya 2720 WL (= 27,2 DL = 0,272 BGL)
+    old_era = ["sell growscan 2720", "buy gs 2600", "sell growscan 2800", "sell growscan 27dl",
+               "buy growscan 2650", "sell growscan 8400 bgl", "sell growscan 8400"]
+    show("era lama, anchor dari tetangga 0.27 BGL", old_era, anchor_bgl=0.27)
+    show("era lama, TANPA anchor (hanya 1 eksplisit -> aturan statis)", old_era)
+
+    # Era sekarang
+    now_era = ["Sell growscan 610 <:DL:880251434380165130>", "buy growscan 550", "sell GS GSCAN 6 <:BGL:880251420413161533>",
+               "sell growscan 6", "buy gs 5500", "sell growscan 9999bgl"]
+    show("era sekarang, anchor 6.0 BGL", now_era, anchor_bgl=6.0)

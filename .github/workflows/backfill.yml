@@ -6,15 +6,25 @@ on:
       start_date:
         description: 'Start Date (YYYY-MM-DD)'
         required: true
-        default: '2026-09-26'
+        default: '2023-01-01'
       end_date:
         description: 'End Date (YYYY-MM-DD)'
         required: true
-        default: '2026-10-01'
+        default: '2026-10-03'
+
+permissions:
+  contents: read
+  actions: write   # agar workflow bisa menjalankan dirinya sendiri untuk melanjutkan
+
+# Hanya satu run pada satu waktu, supaya tidak ada dua scraper memproses hari yang sama.
+concurrency:
+  group: scraper
+  cancel-in-progress: false
 
 jobs:
   run-backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 355   # batas GitHub 360 menit; pipeline berhenti rapi di menit 330
 
     defaults:
       run:
@@ -28,17 +38,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
       - name: Execute Scraper Pipeline
+        id: scrape
         env:
           DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
           DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: |
-          python pipeline.py --backfill ${{ github.event.inputs.start_date }} ${{ github.event.inputs.end_date }}
+          START: ${{ github.event.inputs.start_date }}
+          END: ${{ github.event.inputs.end_date }}
+        run: python pipeline.py --backfill "$START" "$END" --max-minutes 330
+
+      # Kalau masih ada hari tersisa, jalankan workflow yang sama lagi.
+      # Hari yang sudah selesai otomatis dilewati lewat tabel scrape_log.
+      - name: Continue in a new run
+        if: steps.scrape.outputs.remaining != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          START: ${{ github.event.inputs.start_date }}
+          END: ${{ github.event.inputs.end_date }}
+        run: gh workflow run "${{ github.workflow }}" -f start_date="$START" -f end_date="$END"

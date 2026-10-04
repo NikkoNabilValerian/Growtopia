@@ -42,3 +42,15 @@ CREATE POLICY "public read" ON daily_item_prices
     FOR SELECT TO anon USING (true);
 
 GRANT SELECT ON item_list TO anon;
+
+-- Catatan hari yang sudah selesai di-scrape, agar tidak dikerjakan dua kali.
+-- RLS aktif tanpa policy: hanya scraper (secret key) yang bisa membaca/menulis.
+CREATE TABLE IF NOT EXISTS scrape_log (
+    date       DATE PRIMARY KEY,
+    offers     INT NOT NULL DEFAULT 0,   -- jumlah penawaran yang terbaca hari itu
+    scraped_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+ALTER TABLE scrape_log ENABLE ROW LEVEL SECURITY;
+
+-- Hanya sekali, untuk data yang sudah ada sebelum scrape_log dibuat:
+-- INSERT INTO scrape_log (date) SELECT DISTINCT date FROM daily_item_prices ON CONFLICT DO NOTHING;
