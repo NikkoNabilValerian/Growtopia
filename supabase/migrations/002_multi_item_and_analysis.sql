@@ -1,68 +1,79 @@
--- Skema lengkap (instalasi baru). Untuk database yang SUDAH ada, jalankan
--- migrations/002_multi_item_and_analysis.sql sebagai gantinya.
+-- MIGRASI 002: multi-item + kolom penulis unik + tabel analisis.
+-- Untuk database yang sudah berisi data dari skema sebelumnya.
 --
--- Harga disimpan dalam BGL. 1 BGL = 100 DL = 10.000 WL, jadi 1 WL = 0.0001 BGL.
+-- ATURAN PENTING:
+--   * Jalankan HANYA setelah backfill di GitHub Actions SELESAI (tidak ada run yang
+--     berjalan atau pending), karena scraper versi lama memakai scrape_log lama.
+--   * Seluruh skrip berjalan dalam satu transaksi: kalau ada yang gagal, tidak ada
+--     perubahan sama sekali (data aman).
+--   * Data harga dipertahankan. Urutan kolom dirapikan (Postgres tidak bisa memindah
+--     kolom, jadi tabel dibuat ulang lalu datanya disalin).
 
--- Ringkasan harga harian (permanen). Satu baris per item per hari.
-CREATE TABLE IF NOT EXISTS daily_item_prices (
+BEGIN;
+
+-- 1) Salin data harga ke tabel sementara, lalu bangun ulang dengan urutan kolom rapi.
+CREATE TEMP TABLE _old_prices ON COMMIT DROP AS SELECT * FROM daily_item_prices;
+
+DROP VIEW IF EXISTS item_list;
+DROP TABLE daily_item_prices;
+
+CREATE TABLE daily_item_prices (
     id             BIGSERIAL PRIMARY KEY,
     item_name      VARCHAR(100)   NOT NULL,
     date           DATE           NOT NULL,
-    -- Harga median (utama): gabungan, per sisi, dan 1-suara-per-penulis
-    median_price   NUMERIC(14, 4) NOT NULL,   -- gabungan buy + sell
-    buy_median     NUMERIC(14, 4),            -- NULL = postingan sisi itu < 3
+    median_price   NUMERIC(14, 4) NOT NULL,
+    buy_median     NUMERIC(14, 4),
     sell_median    NUMERIC(14, 4),
-    author_median  NUMERIC(14, 4),            -- median dari median tiap penulis (anti-spam)
-    -- Statistik pendukung (gabungan)
+    author_median  NUMERIC(14, 4),
     avg_price      NUMERIC(14, 4) NOT NULL,
     min_price      NUMERIC(14, 4) NOT NULL,
     max_price      NUMERIC(14, 4) NOT NULL,
-    -- Jumlah postingan
     total_volume   INT            NOT NULL,
     buy_volume     INT            NOT NULL DEFAULT 0,
     sell_volume    INT            NOT NULL DEFAULT 0,
-    -- Jumlah penulis unik (0 = belum dihitung pada data lama)
     total_authors  INT            NOT NULL DEFAULT 0,
     buy_authors    INT            NOT NULL DEFAULT 0,
     sell_authors   INT            NOT NULL DEFAULT 0,
     created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_item_date UNIQUE (item_name, date)
 );
-CREATE INDEX IF NOT EXISTS idx_item_date ON daily_item_prices (item_name, date DESC);
+CREATE INDEX idx_item_date ON daily_item_prices (item_name, date DESC);
 
--- Catatan hari yang sudah selesai di-scrape, PER ITEM, agar tidak dikerjakan dua kali.
-CREATE TABLE IF NOT EXISTS scrape_log (
-    item_name  VARCHAR(100) NOT NULL,
-    date       DATE         NOT NULL,
-    offers     INT          NOT NULL DEFAULT 0,
-    scraped_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (item_name, date)
-);
+INSERT INTO daily_item_prices
+    (item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
+     total_volume, buy_volume, sell_volume, created_at)
+SELECT item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
+       total_volume, buy_volume, sell_volume, created_at
+FROM _old_prices
+ORDER BY item_name, date;
 
--- Metadata item (diisi otomatis oleh pipeline dari scraper/items.py).
+-- 2) scrape_log menjadi per item. Semua baris lama adalah milik growscan.
+ALTER TABLE scrape_log ADD COLUMN IF NOT EXISTS item_name VARCHAR(100) NOT NULL DEFAULT 'growscan';
+ALTER TABLE scrape_log DROP CONSTRAINT IF EXISTS scrape_log_pkey;
+ALTER TABLE scrape_log ADD PRIMARY KEY (item_name, date);
+ALTER TABLE scrape_log ALTER COLUMN item_name DROP DEFAULT;
+
+-- 3) Tabel baru
 CREATE TABLE IF NOT EXISTS items (
     item_name  VARCHAR(100) PRIMARY KEY,
     label      TEXT NOT NULL,
     sort_order INT  NOT NULL DEFAULT 0
 );
 
--- Kalender event / kejadian penting. Diisi manual (Table Editor atau import CSV).
--- start_date = end_date -> ditampilkan sebagai garis vertikal (mis. perubahan sistem).
 CREATE TABLE IF NOT EXISTS events (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
     start_date DATE NOT NULL,
     end_date   DATE NOT NULL,
-    kind       TEXT NOT NULL DEFAULT 'event',   -- 'event' | 'structural'
+    kind       TEXT NOT NULL DEFAULT 'event',
     notes      TEXT,
     CHECK (end_date >= start_date)
 );
 
--- Keluaran model analisis (diisi oleh skrip sinyal harian; kosong sampai model aktif).
 CREATE TABLE IF NOT EXISTS item_signals (
     item_name VARCHAR(100) NOT NULL,
     date      DATE         NOT NULL,
-    predicted NUMERIC(14, 4),          -- harga prediksi model (BGL)
+    predicted NUMERIC(14, 4),
     resid_z   NUMERIC(8, 3),
     spread_z  NUMERIC(8, 3),
     signal    TEXT NOT NULL CHECK (signal IN ('BUY', 'SELL', 'HOLD', 'NO_TRADE')),
@@ -70,7 +81,11 @@ CREATE TABLE IF NOT EXISTS item_signals (
     PRIMARY KEY (item_name, date)
 );
 
--- Daftar item untuk dropdown (urut sesuai items.py, lalu yang paling ramai).
+-- Label growscan langsung diisi; item lain diisi otomatis oleh pipeline.
+INSERT INTO items (item_name, label, sort_order) VALUES ('growscan', 'Growscan 9000', 0)
+ON CONFLICT (item_name) DO NOTHING;
+
+-- 4) View dropdown
 CREATE OR REPLACE VIEW item_list WITH (security_invoker = true) AS
 SELECT p.item_name,
        COALESCE(i.label, p.item_name)  AS label,
@@ -83,13 +98,12 @@ LEFT JOIN items i ON i.item_name = p.item_name
 GROUP BY p.item_name, i.label, i.sort_order
 ORDER BY COALESCE(i.sort_order, 999), SUM(p.total_volume) DESC;
 
--- Keamanan: website (publishable/anon key) hanya boleh MEMBACA.
--- Scraper memakai secret key, yang melewati RLS.
+-- 5) Keamanan: baca-saja untuk website
 ALTER TABLE daily_item_prices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE items             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE item_signals      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE scrape_log        ENABLE ROW LEVEL SECURITY;   -- tanpa policy: hanya scraper
+ALTER TABLE scrape_log        ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "public read" ON daily_item_prices FOR SELECT TO anon USING (true);
 CREATE POLICY "public read" ON items             FOR SELECT TO anon USING (true);
@@ -97,3 +111,5 @@ CREATE POLICY "public read" ON events            FOR SELECT TO anon USING (true)
 CREATE POLICY "public read" ON item_signals      FOR SELECT TO anon USING (true);
 
 GRANT SELECT ON item_list TO anon;
+
+COMMIT;

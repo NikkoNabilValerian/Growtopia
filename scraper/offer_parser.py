@@ -1,6 +1,6 @@
 """Module 1: parser pesan Discord Growtopia + penghitung ringkasan harian.
 
-Hanya item di TRACKED_ITEMS yang diproses. Pesan dibaca per baris, jadi satu
+Hanya item di items.py yang diproses. Pesan dibaca per baris, jadi satu
 pesan berisi beberapa baris "Sell ..." dihitung sebagai beberapa penawaran.
 
 Satuan harga (WL / DL / BGL) TIDAK diputuskan saat parsing. Parser hanya mencatat
@@ -21,11 +21,11 @@ from statistics import mean, median, quantiles
 # 1 BGL = 100 DL = 10.000 WL. Semua harga dihitung dalam WL dulu.
 WL_PER_UNIT = {"wl": 1, "dl": 100, "bgl": 10_000}
 
-# Item yang dipantau: nama di database -> alias yang dipakai orang di chat.
-# Tambah item baru di sini, mis. "magplant": ["magplant", "mag"].
-TRACKED_ITEMS: dict[str, list[str]] = {
-    "growscan": ["growscan", "gscan", "gs"],
-}
+# Item yang dipantau dibaca dari items.py (satu-satunya file yang diubah untuk menambah item).
+from items import ITEMS
+
+TRACKED_ITEMS: dict[str, list[str]] = {name: cfg["aliases"] for name, cfg in ITEMS.items()}
+ITEM_LABELS: dict[str, str] = {name: cfg.get("label", name) for name, cfg in ITEMS.items()}
 
 # Emoji custom Discord muncul di teks mentah sebagai <:nama:id>.
 # Dicocokkan lewat nama (huruf kecil, tanpa underscore) atau lewat id.
@@ -41,9 +41,11 @@ EMOJI_ID_UNITS: dict[str, str] = {
     "880251447470596157": "wl",
 }
 
-# Bagian nama item yang berupa angka (bukan harga), mis. "Growscan 9000".
+# Bagian nama item yang berupa angka (bukan harga), mis. "Growscan 9000" -> "growscan".
 NOISE_PATTERNS = [
-    re.compile(r"(?<![a-z0-9])(growscan|gscan)\s*9000(?![a-z0-9])", re.I),
+    re.compile(r"(?<![a-z0-9])(?:" + pat + r")(?![a-z0-9])", re.I)
+    for cfg in ITEMS.values()
+    for pat in cfg.get("noise", [])
 ]
 
 # --- Penentuan satuan untuk angka tanpa satuan -------------------------------
@@ -57,7 +59,7 @@ MIN_EXPLICIT_FOR_ANCHOR = 3
 # dibuang (mis. "84bgl" saat harga sebenarnya 84 DL). Berlaku juga untuk satuan eksplisit.
 ANCHOR_TOLERANCE = 5.0
 # Aturan statis cadangan: angka tanpa satuan >= batas ini dianggap DL, selain itu BGL.
-BARE_DL_MIN: dict[str, float] = {"growscan": 50}
+BARE_DL_MIN: dict[str, float] = {n: c["bare_dl_min"] for n, c in ITEMS.items() if "bare_dl_min" in c}
 DEFAULT_BARE_DL_MIN = 50
 
 MIN_POSTS_TO_STORE = 3   # hari/sisi dengan sampel < 3 postingan tidak disimpan
@@ -75,7 +77,13 @@ ACTIONS = {
 ACTION_RE = re.compile(r"(?<![a-z0-9])(sell|selling|wts|buy|buying|wtb)(?![a-z0-9])", re.I)
 EMOJI_RE = re.compile(r"<a?:(\w+):(\d+)>")
 
-ALIAS_TO_ITEM = {a.lower(): item for item, aliases in TRACKED_ITEMS.items() for a in aliases}
+ALIAS_TO_ITEM: dict[str, str] = {}
+for _item, _aliases in TRACKED_ITEMS.items():
+    for _a in _aliases:
+        _a = _a.lower()
+        if ALIAS_TO_ITEM.get(_a, _item) != _item:
+            raise ValueError(f"Alias '{_a}' dipakai oleh dua item: {ALIAS_TO_ITEM[_a]} dan {_item} (items.py)")
+        ALIAS_TO_ITEM[_a] = _item
 ALIAS_RE = re.compile(
     r"(?<![a-z0-9])(?:"
     + "|".join(re.escape(a) for a in sorted(ALIAS_TO_ITEM, key=len, reverse=True))
@@ -115,7 +123,7 @@ def _normalize(text: str) -> str:
 
     text = EMOJI_RE.sub(emoji, text)  # juga membuang id emoji agar tidak terbaca sebagai harga
     for pat in NOISE_PATTERNS:
-        text = pat.sub(r"\1", text)
+        text = pat.sub(lambda m: m.group(1) or "", text)
     return text
 
 
@@ -236,10 +244,15 @@ def summarize_day(
         resolved = kept
 
     groups: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"all": [], "buy": [], "sell": []})
+    by_author: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    side_authors: dict[str, dict[str, set]] = defaultdict(lambda: {"buy": set(), "sell": set()})
     for r in resolved:
         bgl = r.price_wl / 10_000  # WL -> BGL
-        groups[r.offer.item]["all"].append(bgl)
-        groups[r.offer.item][r.offer.action].append(bgl)
+        o = r.offer
+        groups[o.item]["all"].append(bgl)
+        groups[o.item][o.action].append(bgl)
+        by_author[o.item][o.author].append(bgl)
+        side_authors[o.item][o.action].add(o.author)
 
     rows = []
     for item, g in groups.items():
@@ -250,12 +263,17 @@ def summarize_day(
             continue
         buy_median, buy_volume = _segment(g["buy"])
         sell_median, sell_volume = _segment(g["sell"])
+        # Satu suara per penulis: median dari median tiap penulis. Tidak terpengaruh
+        # penulis yang mengulang postingan puluhan kali.
+        author_prices = [median(v) for v in by_author[item].values()]
+        author_median = round(median(iqr_filter(author_prices) or author_prices), 4)
         rows.append(
             {
                 "item_name": item,
                 "date": day,
                 "avg_price": round(mean(clean), 4),
                 "median_price": round(median(clean), 4),   # gabungan
+                "author_median": author_median,
                 "min_price": round(min(clean), 4),
                 "max_price": round(max(clean), 4),
                 "total_volume": len(g["all"]),              # sebelum filter IQR
@@ -263,6 +281,9 @@ def summarize_day(
                 "sell_median": sell_median,
                 "buy_volume": buy_volume,
                 "sell_volume": sell_volume,
+                "total_authors": len(by_author[item]),
+                "buy_authors": len(side_authors[item]["buy"]),
+                "sell_authors": len(side_authors[item]["sell"]),
             }
         )
     return rows

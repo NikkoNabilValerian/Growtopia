@@ -1,11 +1,15 @@
 """Module 2: Discord (akun tumbal) -> parse -> ringkas -> upsert ke Supabase.
 
+Item yang dipantau dikonfigurasi di items.py. Satu kali membaca pesan Discord melayani
+SEMUA item, jadi menambah item hampir tidak menambah waktu scrape.
+
 Pemakaian:
-    python pipeline.py                              # susul: semua hari baru sejak scrape terakhir s/d kemarin
+    python pipeline.py                              # susul: semua hari baru s/d kemarin
     python pipeline.py --date 2026-10-02            # satu hari tertentu
     python pipeline.py --backfill 2023-01-01 2026-10-03   # dari yang TERBARU ke terlama
     python pipeline.py --backfill 2023-01-01 2026-10-03 --oldest-first
     python pipeline.py --backfill 2021-01-01 2026-09-25 --every 45   # tahap kerangka (titik acuan)
+    python pipeline.py --backfill ... --items magplant,growscan      # hanya item tertentu
     python pipeline.py --date 2023-04-20 --dry-run  # hitung & tampilkan, TANPA menyimpan
     python pipeline.py --date 2023-04-20 --dry-run --anchor-bgl 0.2   # uji dengan perkiraan harga sebenarnya
     python pipeline.py --backfill 2023-01-01 2026-10-03 --force   # proses ulang walau sudah pernah
@@ -16,14 +20,14 @@ Backfill berjalan dari tanggal terbaru ke terlama: satuan harga untuk angka tanp
 satuan ("growscan 2720") ditentukan dari harga tersimpan di hari-hari yang lebih baru,
 yang sudah benar, lalu rantai itu menjalar mundur.
 
-Hari yang sudah selesai dicatat di tabel scrape_log, dan otomatis dilewati pada
+Hari yang sudah selesai dicatat PER ITEM di tabel scrape_log dan otomatis dilewati pada
 run berikutnya (kecuali --force). Hari ini (belum lengkap) tidak pernah dicatat.
 
 Environment variables:
     DISCORD_USER_TOKEN     token akun tumbal (simpan di .env / env var, JANGAN di-commit)
     DISCORD_CHANNEL_IDS    id channel, pisahkan dengan koma
     SUPABASE_URL
-    SUPABASE_SERVICE_KEY   service_role key (jangan dipakai di frontend)
+    SUPABASE_SERVICE_KEY   secret key (jangan dipakai di frontend)
     TZ_NAME                default Asia/Jakarta
     REQUEST_DELAY          jeda antar request dalam detik, default 0.7
 
@@ -44,8 +48,9 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client
 
+from items import ITEMS
 from offer_parser import (
-    TRACKED_ITEMS,
+    ITEM_LABELS,
     Offer,
     mentions_tracked,
     parse_message,
@@ -187,25 +192,45 @@ def today_local() -> date:
     return datetime.now(TZ).date()
 
 
-def scraped_days(sb, start: date, end: date) -> set[date]:
-    """Tanggal dalam [start, end] yang sudah tercatat selesai di scrape_log."""
-    done: set[date] = set()
-    for offset in range(0, 1_000_000, 1000):
-        data = (
-            sb.table(LOG_TABLE).select("date")
-            .gte("date", start.isoformat()).lte("date", end.isoformat())
-            .order("date").range(offset, offset + 999).execute().data
-        )
-        done.update(date.fromisoformat(r["date"]) for r in data)
-        if len(data) < 1000:
-            break
+# ----------------------------------------------------------- scrape_log per item
+
+def logged_days(sb, items: list[str], start: date, end: date) -> dict[str, set[date]]:
+    """Tanggal dalam [start, end] yang sudah selesai, per item."""
+    done: dict[str, set[date]] = {i: set() for i in items}
+    for item in items:
+        for offset in range(0, 1_000_000, 1000):
+            data = (
+                sb.table(LOG_TABLE).select("date").eq("item_name", item)
+                .gte("date", start.isoformat()).lte("date", end.isoformat())
+                .order("date").range(offset, offset + 999).execute().data
+            )
+            done[item].update(date.fromisoformat(r["date"]) for r in data)
+            if len(data) < 1000:
+                break
     return done
 
 
-def last_scraped_day(sb) -> date | None:
-    data = sb.table(LOG_TABLE).select("date").order("date", desc=True).limit(1).execute().data
+def last_logged_day(sb, item: str) -> date | None:
+    data = (sb.table(LOG_TABLE).select("date").eq("item_name", item)
+            .order("date", desc=True).limit(1).execute().data)
     return date.fromisoformat(data[0]["date"]) if data else None
 
+
+def item_has_rows(sb, item: str) -> bool:
+    return bool(sb.table(TABLE).select("date").eq("item_name", item).limit(1).execute().data)
+
+
+def sync_items(sb, items: list[str]) -> None:
+    """Salin label item dari items.py ke tabel items agar website bisa menampilkannya."""
+    try:
+        rows = [{"item_name": n, "label": ITEM_LABELS[n], "sort_order": i}
+                for i, n in enumerate(ITEMS) if n in items]
+        sb.table("items").upsert(rows, on_conflict="item_name").execute()
+    except Exception as e:  # tabel belum dimigrasi: jangan hentikan scrape
+        print(f"[peringatan] sinkronisasi tabel items dilewati ({type(e).__name__}).", flush=True)
+
+
+# ------------------------------------------------------------------- anchor
 
 def fetch_anchor(sb, item: str, day: date, side: str) -> float | None:
     """Level harga (dalam WL) dari baris tersimpan terdekat, dipakai untuk menentukan
@@ -233,38 +258,51 @@ def fetch_anchor(sb, item: str, day: date, side: str) -> float | None:
     return median_bgl * 10_000  # BGL -> WL
 
 
-def get_anchors(sb, day: date, side: str, override_bgl: float | None) -> dict[str, float | None]:
+def make_seeds(sb, items: list[str]) -> dict[str, float]:
+    """Patokan awal (WL) dari items.py, hanya untuk item yang belum punya data sama sekali."""
+    return {
+        i: ITEMS[i]["seed_anchor_bgl"] * 10_000
+        for i in items
+        if ITEMS[i].get("seed_anchor_bgl") and not item_has_rows(sb, i)
+    }
+
+
+def get_anchors(sb, items: list[str], day: date, side: str, override_bgl: float | None,
+                seeds: dict[str, float]) -> dict[str, float | None]:
     if override_bgl:  # anchor manual dari --anchor-bgl, berlaku untuk semua item
-        return {item: override_bgl * 10_000 for item in TRACKED_ITEMS}
-    return {item: fetch_anchor(sb, item, day, side) for item in TRACKED_ITEMS}
+        return {i: override_bgl * 10_000 for i in items}
+    return {i: fetch_anchor(sb, i, day, side) or seeds.get(i) for i in items}
 
 
 def dry_run_day(sb, dc: DiscordClient, channel_ids: list[int], day: date, side: str,
-                override_bgl: float | None = None) -> None:
+                items: list[str], override_bgl: float | None, seeds: dict[str, float]) -> None:
     """Jalankan seluruh perhitungan untuk satu hari dan tampilkan hasilnya, tanpa menyimpan."""
-    anchors = get_anchors(sb, day, side, override_bgl)
-    offers = fetch_day(dc, channel_ids, day)
+    anchors = get_anchors(sb, items, day, side, override_bgl, seeds)
+    offers = [o for o in fetch_day(dc, channel_ids, day) if o.item in items]
     resolved = resolve_offers(offers, anchors)
 
     print(f"\n=== {day} (DRY RUN, tidak ada yang disimpan) ===")
-    for item, a in anchors.items():
-        print(f"anchor {item}: " + (f"{a / 10_000:.4g} BGL" if a else "tidak ada (pakai satuan eksplisit / aturan statis)"))
-    print("hasil penentuan satuan:", dict(Counter(r.how for r in resolved)))
-    dropped = [r.offer for r in resolved if r.price_wl is None][:8]
-    if dropped:
-        print("contoh yang dibuang:", ", ".join(f"{o.value:g} {o.unit or '(tanpa satuan)'}" for o in dropped))
+    for item in items:
+        a = anchors.get(item)
+        print(f"[{item}] anchor: " + (f"{a / 10_000:.4g} BGL" if a else "tidak ada (pakai satuan eksplisit / aturan statis)"))
+        mine = [r for r in resolved if r.offer.item == item]
+        print(f"[{item}] hasil penentuan satuan:", dict(Counter(r.how for r in mine)))
+        dropped = [r.offer for r in mine if r.price_wl is None][:8]
+        if dropped:
+            print(f"[{item}] contoh yang dibuang:", ", ".join(f"{o.value:g} {o.unit or '(tanpa satuan)'}" for o in dropped))
     rows = summarize_day(offers, day.isoformat(), anchors)
     if not rows:
         print("tidak ada baris yang akan disimpan (postingan valid < 3)")
     for r in rows:
-        print(f"{r['item_name']}: gabungan {r['median_price']} | buy {r['buy_median']} | "
-              f"sell {r['sell_median']} BGL  ({r['total_volume']} postingan)")
+        print(f"[{r['item_name']}] gabungan {r['median_price']} | buy {r['buy_median']} | sell {r['sell_median']} | "
+              f"1-suara-per-penulis {r['author_median']} BGL  ({r['total_volume']} postingan, {r['total_authors']} penulis)")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", type=date.fromisoformat)
     ap.add_argument("--backfill", nargs=2, type=date.fromisoformat, metavar=("FROM", "TO"))
+    ap.add_argument("--items", help="daftar item dipisah koma (default: semua item di items.py)")
     ap.add_argument("--oldest-first", action="store_true",
                     help="backfill dari terlama ke terbaru (default: terbaru ke terlama)")
     ap.add_argument("--dry-run", action="store_true",
@@ -282,6 +320,13 @@ def main():
     ap.add_argument("--sample", type=int, metavar="N",
                     help="tampilkan N pesan mentah + hasil parsing, tanpa menyimpan ke Supabase")
     args = ap.parse_args()
+
+    items = list(ITEMS)
+    if args.items:
+        items = [i.strip() for i in args.items.split(",") if i.strip()]
+        unknown = [i for i in items if i not in ITEMS]
+        if unknown:
+            raise SystemExit(f"Item tidak dikenal: {unknown}. Item yang ada di items.py: {list(ITEMS)}")
 
     today = today_local()
     yesterday = today - timedelta(days=1)
@@ -308,31 +353,41 @@ def main():
     elif args.date:
         days, side = [args.date], "later"
     else:  # mode susul: lanjut dari hari setelah scrape terakhir sampai kemarin
-        last = last_scraped_day(sb)
-        days = list(daterange(last + timedelta(days=1) if last else yesterday, yesterday))
+        lasts = [d for d in (last_logged_day(sb, i) for i in items) if d]
+        days = list(daterange(min(lasts) + timedelta(days=1) if lasts else yesterday, yesterday))
         side = "earlier"
+
+    seeds = make_seeds(sb, items)
 
     if args.dry_run:
         for day in days:
-            dry_run_day(sb, dc, channel_ids, day, side, args.anchor_bgl)
+            dry_run_day(sb, dc, channel_ids, day, side, items, args.anchor_bgl, seeds)
         return
 
-    if not args.force:
+    # pending[hari] = item yang belum selesai di hari itu
+    if args.force:
+        pending = {d: list(items) for d in days}
+    else:
         partial = [d for d in days if d >= today]
         if partial:
             print(f"Dilewati {len(partial)} hari yang belum lengkap (hari ini/masa depan). Pakai --force untuk memaksa.")
             days = [d for d in days if d < today]
+        pending = {d: list(items) for d in days}
         if days:
-            done = scraped_days(sb, min(days), max(days))
-            if done:
-                print(f"Dilewati {len(done)} hari yang sudah pernah di-scrape (pakai --force untuk mengulang).")
-            days = [d for d in days if d not in done]
+            done = logged_days(sb, items, min(days), max(days))
+            pending = {d: [i for i in items if d not in done[i]] for d in days}
+            skipped = sum(1 for d in days if not pending[d])
+            if skipped:
+                print(f"Dilewati {skipped} hari yang sudah selesai untuk semua item (pakai --force untuk mengulang).")
+            days = [d for d in days if pending[d]]
 
     if not days:
         print("Tidak ada hari baru untuk diproses.")
         set_github_output("remaining", 0)
         return
-    print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} (urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu)", flush=True)
+    sync_items(sb, items)
+    print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} "
+          f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: {', '.join(items)}", flush=True)
 
     started = _time.monotonic()
     remaining = 0
@@ -344,28 +399,33 @@ def main():
             print(f"Batas waktu {args.max_minutes:g} menit tercapai. "
                   f"Sisa {remaining} hari, lanjut di run berikutnya.", flush=True)
             break
-        anchors = get_anchors(sb, day, side, args.anchor_bgl)
+        todo = pending[day]
+        anchors = get_anchors(sb, todo, day, side, args.anchor_bgl, seeds)
         try:
-            offers = fetch_day(dc, channel_ids, day)
+            all_offers = fetch_day(dc, channel_ids, day)
         except TransientError as e:
             failed += 1
             print(f"{day}: GAGAL sementara ({e}). Dilewati, akan dicoba lagi di run berikutnya.", flush=True)
             continue
+        offers = [o for o in all_offers if o.item in todo]
         rows = summarize_day(offers, day.isoformat(), anchors)
         if rows:
             sb.table(TABLE).upsert(rows, on_conflict="item_name,date").execute()
         # Hapus baris lama item yang kini tidak punya data valid hari itu (mis. hasil
         # parsing versi lama yang salah), supaya tidak tertinggal di chart.
         have = {r["item_name"] for r in rows}
-        for item in TRACKED_ITEMS:
+        for item in todo:
             if item not in have:
                 sb.table(TABLE).delete().eq("item_name", item).eq("date", day.isoformat()).execute()
+        counts = Counter(o.item for o in offers)
         if day < today:  # hari yang belum selesai tidak dicatat, supaya diulang besok
             sb.table(LOG_TABLE).upsert(
-                {"date": day.isoformat(), "offers": len(offers)}, on_conflict="date"
+                [{"item_name": item, "date": day.isoformat(), "offers": counts.get(item, 0)} for item in todo],
+                on_conflict="item_name,date",
             ).execute()
         succeeded += 1
-        print(f"{day}: {len(offers)} penawaran -> {len(rows)} baris tersimpan", flush=True)
+        summary = ", ".join(f"{item}: {counts.get(item, 0)} -> {'1' if item in have else '0'} baris" for item in todo)
+        print(f"{day}: {summary}", flush=True)
 
     if failed and not succeeded:
         # Tidak ada kemajuan sama sekali: jangan memicu run lanjutan (bisa berputar tanpa henti).
