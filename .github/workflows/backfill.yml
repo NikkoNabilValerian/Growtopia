@@ -6,63 +6,135 @@ on:
       start_date:
         description: 'Start Date (YYYY-MM-DD)'
         required: true
-        default: '2023-01-01'
+        default: '2021-01-01'
       end_date:
         description: 'End Date (YYYY-MM-DD)'
         required: true
-        default: '2026-10-03'
+        default: '2026-09-25'
+      chunks:
+        description: 'Jumlah scraper paralel (mulai kecil, mis. 4, lalu naikkan)'
+        required: true
+        default: '4'
+      skeleton_every:
+        description: 'Tahap kerangka: ambil 1 hari tiap N hari lebih dulu (0 = lewati)'
+        required: true
+        default: '45'
 
 permissions:
   contents: read
-  actions: write   # agar workflow bisa menjalankan dirinya sendiri untuk melanjutkan
+  actions: write   # agar tiap scraper bisa menjalankan dirinya sendiri untuk melanjutkan
 
-# Hanya satu run pada satu waktu, supaya tidak ada dua scraper memproses hari yang sama.
+# Run dengan rentang yang sama tidak boleh tumpang tindih;
+# rentang berbeda (potongan paralel) boleh berjalan bersamaan.
 concurrency:
-  group: scraper
+  group: scraper-${{ inputs.start_date }}-${{ inputs.end_date }}-${{ inputs.chunks }}
   cancel-in-progress: false
 
 jobs:
-  run-backfill:
+  # 1) Bagi rentang tanggal menjadi N potongan berurutan dengan ukuran hampir sama.
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # batas GitHub 360 menit; pipeline berhenti rapi di menit 330
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - id: split
+        env:
+          START: ${{ inputs.start_date }}
+          END: ${{ inputs.end_date }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from datetime import date, timedelta
+          start = date.fromisoformat(os.environ["START"])
+          end = date.fromisoformat(os.environ["END"])
+          total = (end - start).days + 1
+          n = max(1, min(int(os.environ["CHUNKS"]), total, 20))
+          size, extra = divmod(total, n)
+          include, cur = [], start
+          for i in range(n):
+              last = cur + timedelta(days=size + (1 if i < extra else 0) - 1)
+              include.append({"id": i + 1, "start": cur.isoformat(), "end": last.isoformat()})
+              cur = last + timedelta(days=1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": include}) + "\n")
+          for c in include:
+              print(c)
+          PY
 
+  # 2) Kerangka: 1 hari tiap N hari, dikerjakan berurutan dari terbaru ke terlama.
+  #    Ini menyebar titik acuan harga agar tiap potongan paralel tahu skala harga di
+  #    zamannya (angka tanpa satuan seperti "2720" ditentukan dari acuan ini).
+  skeleton:
+    needs: plan
+    if: ${{ inputs.skeleton_every != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
     defaults:
       run:
         working-directory: ./scraper
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: pip
           cache-dependency-path: scraper/requirements.txt
-
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Scrape skeleton days
+        env:
+          DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
+          DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          START: ${{ inputs.start_date }}
+          END: ${{ inputs.end_date }}
+          EVERY: ${{ inputs.skeleton_every }}
+        run: python pipeline.py --backfill "$START" "$END" --every "$EVERY" --max-minutes 330
 
-      - name: Execute Scraper Pipeline
+  # 3) Scraper paralel: tiap potongan memproses harinya dari terbaru ke terlama.
+  scrape:
+    needs: [plan, skeleton]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.skeleton.result == 'success' || needs.skeleton.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ./scraper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Scrape chunk ${{ matrix.id }} (${{ matrix.start }} to ${{ matrix.end }})
         id: scrape
         env:
           DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
           DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          START: ${{ github.event.inputs.start_date }}
-          END: ${{ github.event.inputs.end_date }}
+          START: ${{ matrix.start }}
+          END: ${{ matrix.end }}
         run: python pipeline.py --backfill "$START" "$END" --max-minutes 330
 
-      # Kalau masih ada hari tersisa, jalankan workflow yang sama lagi.
+      # Kalau potongan ini belum selesai, jalankan lagi hanya potongan ini.
       # Hari yang sudah selesai otomatis dilewati lewat tabel scrape_log.
-      - name: Continue in a new run
+      - name: Continue this chunk in a new run
         if: steps.scrape.outputs.remaining != '0'
         env:
           GH_TOKEN: ${{ github.token }}
-          START: ${{ github.event.inputs.start_date }}
-          END: ${{ github.event.inputs.end_date }}
-        run: gh workflow run "${{ github.workflow }}" -f start_date="$START" -f end_date="$END"
+          START: ${{ matrix.start }}
+          END: ${{ matrix.end }}
+        run: >
+          gh workflow run "${{ github.workflow }}"
+          -f start_date="$START" -f end_date="$END" -f chunks=1 -f skeleton_every=0

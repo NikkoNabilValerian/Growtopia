@@ -5,6 +5,7 @@ Pemakaian:
     python pipeline.py --date 2026-10-02            # satu hari tertentu
     python pipeline.py --backfill 2023-01-01 2026-10-03   # dari yang TERBARU ke terlama
     python pipeline.py --backfill 2023-01-01 2026-10-03 --oldest-first
+    python pipeline.py --backfill 2021-01-01 2026-09-25 --every 45   # tahap kerangka (titik acuan)
     python pipeline.py --date 2023-04-20 --dry-run  # hitung & tampilkan, TANPA menyimpan
     python pipeline.py --date 2023-04-20 --dry-run --anchor-bgl 0.2   # uji dengan perkiraan harga sebenarnya
     python pipeline.py --backfill 2023-01-01 2026-10-03 --force   # proses ulang walau sudah pernah
@@ -79,7 +80,9 @@ class DiscordClient:
         for _ in range(8):
             r = self.s.get(f"{API}{path}", params=params, timeout=30)
             if r.status_code == 429:  # kena rate limit: tunggu sesuai arahan Discord
-                _time.sleep(float(r.json().get("retry_after", 5)) + 0.5)
+                wait = float(r.json().get("retry_after", 5)) + 0.5
+                print(f"[rate limit] Discord meminta menunggu {wait:.1f} detik", flush=True)
+                _time.sleep(wait)
                 continue
             if r.status_code in (401, 403):
                 raise SystemExit(
@@ -243,6 +246,9 @@ def main():
                     help="backfill dari terlama ke terbaru (default: terbaru ke terlama)")
     ap.add_argument("--dry-run", action="store_true",
                     help="hitung dan tampilkan hasil per hari tanpa menyimpan apa pun")
+    ap.add_argument("--every", type=int, metavar="N",
+                    help="hanya proses 1 hari tiap N hari dalam rentang backfill (tahap kerangka untuk "
+                         "scraper paralel: menyebar titik acuan harga dulu)")
     ap.add_argument("--anchor-bgl", type=float, metavar="HARGA",
                     help="paksa level harga acuan (dalam BGL) untuk hari yang diproses, mis. 0.27; "
                          "berguna untuk menguji tanggal lama bersama --dry-run")
@@ -274,6 +280,8 @@ def main():
         else:
             days.reverse()
             side = "later"
+        if args.every and args.every > 1:
+            days = days[::args.every]  # dihitung dari ujung rentang yang diproses lebih dulu
     elif args.date:
         days, side = [args.date], "later"
     else:  # mode susul: lanjut dari hari setelah scrape terakhir sampai kemarin
