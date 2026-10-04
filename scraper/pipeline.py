@@ -61,6 +61,7 @@ TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Jakarta"))
 DELAY = float(os.getenv("REQUEST_DELAY", "0.7"))
 TABLE = "daily_item_prices"
 LOG_TABLE = "scrape_log"
+MAX_TRANSIENT_FAILURES = 8   # ~10 menit total menunggu sebelum satu hari dilewati sementara
 # Anchor dari baris tersimpan yang lebih jauh dari ini (hari) dianggap basi dan diabaikan,
 # karena skala harga bisa berubah banyak dalam beberapa tahun.
 MAX_ANCHOR_AGE_DAYS = int(os.getenv("MAX_ANCHOR_AGE_DAYS", "120"))
@@ -71,27 +72,49 @@ def to_snowflake(dt: datetime) -> int:
     return (int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
 
 
+class TransientError(Exception):
+    """Gangguan sementara dari Discord (5xx / jaringan) yang tidak pulih setelah beberapa kali coba."""
+
+
 class DiscordClient:
     def __init__(self, token: str):
         self.s = requests.Session()
         self.s.headers["Authorization"] = token
 
     def _get(self, path: str, params: dict):
-        for _ in range(8):
-            r = self.s.get(f"{API}{path}", params=params, timeout=30)
-            if r.status_code == 429:  # kena rate limit: tunggu sesuai arahan Discord
-                wait = float(r.json().get("retry_after", 5)) + 0.5
-                print(f"[rate limit] Discord meminta menunggu {wait:.1f} detik", flush=True)
-                _time.sleep(wait)
-                continue
-            if r.status_code in (401, 403):
-                raise SystemExit(
-                    f"Discord menolak akses ({r.status_code}). Cek token, atau akun "
-                    f"tidak punya izin baca channel {path}."
-                )
-            r.raise_for_status()
-            return r.json()
-        raise RuntimeError(f"Terlalu banyak retry untuk {path}")
+        """GET dengan retry: rate limit (429) menunggu sesuai arahan Discord; error server
+        (5xx) dan gangguan jaringan diulang dengan jeda yang makin lama."""
+        failures = 0
+        for _ in range(500):
+            try:
+                r = self.s.get(f"{API}{path}", params=params, timeout=30)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                failures += 1
+                wait = min(60, 5 * failures)
+                print(f"[jaringan] {type(e).__name__}, coba lagi dalam {wait} detik "
+                      f"(gagal ke-{failures})", flush=True)
+            else:
+                if r.status_code == 429:  # rate limit: tunggu sesuai arahan Discord
+                    wait = float(r.json().get("retry_after", 5)) + 0.5
+                    print(f"[rate limit] Discord meminta menunggu {wait:.1f} detik", flush=True)
+                    _time.sleep(wait)
+                    continue
+                if r.status_code in (401, 403):
+                    raise SystemExit(
+                        f"Discord menolak akses ({r.status_code}). Cek token, atau akun "
+                        f"tidak punya izin baca channel {path}."
+                    )
+                if r.status_code < 500:
+                    r.raise_for_status()  # 4xx lain = masalah permanen, jangan diulang
+                    return r.json()
+                failures += 1
+                wait = min(120, 5 * 2 ** min(failures, 5))
+                print(f"[server] Discord membalas {r.status_code}, coba lagi dalam {wait} detik "
+                      f"(gagal ke-{failures})", flush=True)
+            if failures > MAX_TRANSIENT_FAILURES:
+                raise TransientError(f"Discord tidak stabil untuk {path} setelah {failures} percobaan")
+            _time.sleep(wait)
+        raise TransientError(f"Terlalu banyak retry untuk {path}")
 
     def messages_between(self, channel_id: int, start: datetime, end: datetime) -> Iterator[dict]:
         """Ambil pesan [start, end) dengan paginasi mundur (terbaru -> terlama)."""
@@ -313,6 +336,8 @@ def main():
 
     started = _time.monotonic()
     remaining = 0
+    failed = 0
+    succeeded = 0
     for i, day in enumerate(days):
         if args.max_minutes and (_time.monotonic() - started) / 60 >= args.max_minutes:
             remaining = len(days) - i
@@ -320,7 +345,12 @@ def main():
                   f"Sisa {remaining} hari, lanjut di run berikutnya.", flush=True)
             break
         anchors = get_anchors(sb, day, side, args.anchor_bgl)
-        offers = fetch_day(dc, channel_ids, day)
+        try:
+            offers = fetch_day(dc, channel_ids, day)
+        except TransientError as e:
+            failed += 1
+            print(f"{day}: GAGAL sementara ({e}). Dilewati, akan dicoba lagi di run berikutnya.", flush=True)
+            continue
         rows = summarize_day(offers, day.isoformat(), anchors)
         if rows:
             sb.table(TABLE).upsert(rows, on_conflict="item_name,date").execute()
@@ -334,8 +364,15 @@ def main():
             sb.table(LOG_TABLE).upsert(
                 {"date": day.isoformat(), "offers": len(offers)}, on_conflict="date"
             ).execute()
+        succeeded += 1
         print(f"{day}: {len(offers)} penawaran -> {len(rows)} baris tersimpan", flush=True)
-    set_github_output("remaining", remaining)
+
+    if failed and not succeeded:
+        # Tidak ada kemajuan sama sekali: jangan memicu run lanjutan (bisa berputar tanpa henti).
+        raise SystemExit(f"{failed} hari gagal dan tidak ada yang berhasil. Discord mungkin sedang bermasalah; coba lagi nanti.")
+    if failed:
+        print(f"{failed} hari gagal sementara dan akan dicoba lagi di run berikutnya.", flush=True)
+    set_github_output("remaining", remaining + failed)
 
 
 if __name__ == "__main__":
