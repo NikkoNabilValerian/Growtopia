@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import mean, median, quantiles
 
 # ---------------------------------------------------------------- konfigurasi
@@ -62,7 +62,11 @@ ANCHOR_TOLERANCE = 5.0
 BARE_DL_MIN: dict[str, float] = {n: c["bare_dl_min"] for n, c in ITEMS.items() if "bare_dl_min" in c}
 DEFAULT_BARE_DL_MIN = 50
 
-MIN_POSTS_TO_STORE = 3   # hari/sisi dengan sampel < 3 postingan tidak disimpan
+MIN_POSTS_TO_STORE = 3   # hari dengan < 3 postingan valid tidak disimpan (median gabungan)
+# Median per SISI (buy / sell) lebih rapuh karena sampelnya lebih kecil, jadi aturannya lebih ketat:
+MIN_SIDE_POSTS = 5       # satu sisi butuh minimal 5 postingan agar medianya disimpan
+SIDE_BAND = 2.0          # postingan satu sisi di luar [median gabungan / 2, median gabungan x 2] dibuang
+MAX_CROSS = 1.15         # bid > ask x 1.15 tidak masuk akal: sisi dengan postingan lebih sedikit dibuang
 IQR_K = 1.5
 # False = semua postingan dihitung, termasuk harga yang sama berulang
 # (median yang menentukan harga akhir). True = satu penulis + harga sama = 1 suara.
@@ -90,6 +94,8 @@ ALIAS_RE = re.compile(
     + r")(?![a-z0-9])",
     re.I,
 )
+# Angka tanpa satuan yang diikuti kata jumlah barang ("2 pcs") adalah jumlah, bukan harga.
+QTY_AFTER_RE = re.compile(r"\s*(?:pcs?|pieces?|biji|buah|units?)(?![a-z])", re.I)
 PRICE_RE = re.compile(
     r"(?<![\w.,])(?P<num>\d+(?:[.,]\d{1,2})?)\s*(?:(?P<unit>bgl|dl|wl)s?)?(?![a-z0-9])",
     re.I,
@@ -103,6 +109,7 @@ class Offer:
     value: float           # angka mentah seperti yang diketik
     unit: str | None       # "wl" | "dl" | "bgl" | None (tanpa satuan)
     author: str
+    raw: str = field(default="", compare=False)   # baris pesan asli, hanya untuk diagnosis
 
 
 @dataclass(frozen=True)
@@ -142,9 +149,15 @@ def parse_message(text: str, author: str) -> list[Offer]:
         if not act:
             continue  # tanpa buy/sell kemungkinan bukan promosi (mis. pertanyaan harga)
 
-        price = PRICE_RE.search(line, last.end())
-        if not price:
+        # Semua angka setelah alias. Angka dengan satuan eksplisit diutamakan ("buy gs 2 pcs 78dl"
+        # -> 78dl, bukan 2), dan angka tanpa satuan yang diikuti "pcs" dibuang karena itu jumlah.
+        cands = [
+            m for m in PRICE_RE.finditer(line, last.end())
+            if m["unit"] or not QTY_AFTER_RE.match(line, m.end())
+        ]
+        if not cands:
             continue
+        price = next((m for m in cands if m["unit"]), cands[0])
 
         value = float(price["num"].replace(",", "."))
         if value <= 0:
@@ -156,6 +169,7 @@ def parse_message(text: str, author: str) -> list[Offer]:
                 value=value,
                 unit=(price["unit"] or "").lower() or None,
                 author=author,
+                raw=line.strip()[:200],
             )
         )
     return offers
@@ -216,11 +230,17 @@ def iqr_filter(prices: list[float], k: float = IQR_K) -> list[float]:
     return [p for p in prices if lo <= p <= hi]
 
 
-def _segment(prices: list[float]) -> tuple[float | None, int]:
-    """(median setelah filter IQR, jumlah postingan). Median None bila sampel kurang."""
-    if len(prices) < MIN_POSTS_TO_STORE:
+def _segment(prices: list[float], center: float) -> tuple[float | None, int]:
+    """(median satu sisi, jumlah postingan sisi itu).
+
+    Postingan yang jauh dari median gabungan hari itu (`center`) dibuang lebih dulu, karena
+    filter IQR tidak berjalan untuk sampel kecil (< 4) dan satu sisi sering hanya punya
+    beberapa postingan. Median None bila sisa postingan < MIN_SIDE_POSTS.
+    """
+    kept = [p for p in prices if center / SIDE_BAND <= p <= center * SIDE_BAND]
+    if len(kept) < MIN_SIDE_POSTS:
         return None, len(prices)
-    clean = iqr_filter(prices)
+    clean = iqr_filter(kept)
     return (round(median(clean), 4) if clean else None), len(prices)
 
 
@@ -261,8 +281,15 @@ def summarize_day(
         clean = iqr_filter(g["all"])
         if not clean:
             continue
-        buy_median, buy_volume = _segment(g["buy"])
-        sell_median, sell_volume = _segment(g["sell"])
+        center = median(clean)  # median gabungan hari itu, setelah filter IQR
+        buy_median, buy_volume = _segment(g["buy"], center)
+        sell_median, sell_volume = _segment(g["sell"], center)
+        if buy_median and sell_median and buy_median > sell_median * MAX_CROSS:
+            # Bid jauh di atas ask: salah satu sisi pasti keliru. Buang yang lebih sedikit datanya.
+            if buy_volume <= sell_volume:
+                buy_median = None
+            else:
+                sell_median = None
         # Satu suara per penulis: median dari median tiap penulis. Tidak terpengaruh
         # penulis yang mengulang postingan puluhan kali.
         author_prices = [median(v) for v in by_author[item].values()]

@@ -51,6 +51,7 @@ from supabase import create_client
 from items import ITEMS
 from offer_parser import (
     ITEM_LABELS,
+    SIDE_BAND,
     Offer,
     mentions_tracked,
     parse_message,
@@ -294,8 +295,25 @@ def dry_run_day(sb, dc: DiscordClient, channel_ids: list[int], day: date, side: 
     if not rows:
         print("tidak ada baris yang akan disimpan (postingan valid < 3)")
     for r in rows:
-        print(f"[{r['item_name']}] gabungan {r['median_price']} | buy {r['buy_median']} | sell {r['sell_median']} | "
-              f"1-suara-per-penulis {r['author_median']} BGL  ({r['total_volume']} postingan, {r['total_authors']} penulis)")
+        print(f"[{r['item_name']}] gabungan {r['median_price']} | buy {r['buy_median']} (dari {r['buy_volume']} post) | "
+              f"sell {r['sell_median']} (dari {r['sell_volume']} post) | 1-suara-per-penulis {r['author_median']} BGL  "
+              f"({r['total_volume']} postingan, {r['total_authors']} penulis)")
+
+    # Diagnosis: pesan mentah yang harganya jauh dari median hari itu atau dibuang.
+    centers = {r["item_name"]: r["median_price"] for r in rows}
+    far = []
+    for r in resolved:
+        c = centers.get(r.offer.item)
+        if r.price_wl is None:
+            far.append((r, "DIBUANG (jauh dari patokan)"))
+        elif c and not (c / SIDE_BAND <= r.price_wl / 10_000 <= c * SIDE_BAND):
+            far.append((r, f"jauh dari median {c:.4g} BGL"))
+    if far:
+        print(f"\nPesan yang harganya mencurigakan ({len(far)} total, maks. 15 ditampilkan):")
+        for r, why in far[:15]:
+            o = r.offer
+            price = "-" if r.price_wl is None else f"{r.price_wl / 10_000:.4g} BGL"
+            print(f"  [{o.item}] {o.action:4} terbaca {price:>10} ({r.how}) | {why}\n         pesan: {o.raw!r}")
 
 
 def main():
