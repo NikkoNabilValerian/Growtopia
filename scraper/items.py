@@ -25,12 +25,11 @@ Isi tiap entri:
 """
 
 ITEMS: dict[str, dict] = {
-    "growscan": {
-        "label": "Growscan 9000",
-        "aliases": ["growscan", "gscan", "gs"],
-        "noise": [r"(growscan|gscan)\s*9000"],
-        "bare_dl_min": 50,
-        "seed_anchor_bgl": 6.0,
+    "golden heart crystal": {
+        "label": "Golden Heart Crystal",
+        "aliases": ["golden heart crystal", "ghc"],
+        "bare_dl_min": 80,
+        "seed_anchor_bgl": 22.5,
     },
     # Contoh item berikutnya (hapus tanda # lalu sesuaikan):
     # "magplant": {
