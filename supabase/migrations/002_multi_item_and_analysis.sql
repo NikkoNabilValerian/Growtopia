@@ -4,48 +4,65 @@
 -- ATURAN PENTING:
 --   * Jalankan HANYA setelah backfill di GitHub Actions SELESAI (tidak ada run yang
 --     berjalan atau pending), karena scraper versi lama memakai scrape_log lama.
---   * Seluruh skrip berjalan dalam satu transaksi: kalau ada yang gagal, tidak ada
---     perubahan sama sekali (data aman).
---   * Data harga dipertahankan. Urutan kolom dirapikan (Postgres tidak bisa memindah
---     kolom, jadi tabel dibuat ulang lalu datanya disalin).
+--   * Satu transaksi: kalau ada yang gagal, tidak ada perubahan sama sekali.
+--   * Aman dijalankan ulang: bagian pembangunan ulang tabel dilewati bila kolom
+--     author_median sudah ada.
+--   * Tabel lama TIDAK dihapus, hanya diganti nama menjadi daily_item_prices_backup.
+--     Setelah semuanya terverifikasi, hapus manual:  DROP TABLE daily_item_prices_backup;
+--   * Tidak memakai tabel sementara, supaya editor Supabase tidak menampilkan
+--     peringatan RLS palsu. Peringatan "destructive operations" tetap muncul (karena ada
+--     DROP VIEW) dan itu normal: pilih Run.
+--   * Seluruh tabel baru di skrip ini sudah mengaktifkan RLS sendiri di bagian 5.
 
 BEGIN;
 
--- 1) Salin data harga ke tabel sementara, lalu bangun ulang dengan urutan kolom rapi.
-CREATE TEMP TABLE _old_prices ON COMMIT DROP AS SELECT * FROM daily_item_prices;
+-- 1) Bangun ulang daily_item_prices dengan urutan kolom rapi + kolom penulis unik.
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'daily_item_prices' AND column_name = 'author_median'
+  ) THEN
+    DROP VIEW IF EXISTS item_list;
 
-DROP VIEW IF EXISTS item_list;
-DROP TABLE daily_item_prices;
+    ALTER TABLE daily_item_prices RENAME TO daily_item_prices_backup;
+    ALTER INDEX idx_item_date RENAME TO idx_item_date_backup;
+    ALTER TABLE daily_item_prices_backup RENAME CONSTRAINT unique_item_date TO unique_item_date_backup;
+    ALTER TABLE daily_item_prices_backup RENAME CONSTRAINT daily_item_prices_pkey TO daily_item_prices_backup_pkey;
+    ALTER SEQUENCE daily_item_prices_id_seq RENAME TO daily_item_prices_backup_id_seq;
 
-CREATE TABLE daily_item_prices (
-    id             BIGSERIAL PRIMARY KEY,
-    item_name      VARCHAR(100)   NOT NULL,
-    date           DATE           NOT NULL,
-    median_price   NUMERIC(14, 4) NOT NULL,
-    buy_median     NUMERIC(14, 4),
-    sell_median    NUMERIC(14, 4),
-    author_median  NUMERIC(14, 4),
-    avg_price      NUMERIC(14, 4) NOT NULL,
-    min_price      NUMERIC(14, 4) NOT NULL,
-    max_price      NUMERIC(14, 4) NOT NULL,
-    total_volume   INT            NOT NULL,
-    buy_volume     INT            NOT NULL DEFAULT 0,
-    sell_volume    INT            NOT NULL DEFAULT 0,
-    total_authors  INT            NOT NULL DEFAULT 0,
-    buy_authors    INT            NOT NULL DEFAULT 0,
-    sell_authors   INT            NOT NULL DEFAULT 0,
-    created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT unique_item_date UNIQUE (item_name, date)
-);
-CREATE INDEX idx_item_date ON daily_item_prices (item_name, date DESC);
+    CREATE TABLE daily_item_prices (
+        id             BIGSERIAL PRIMARY KEY,
+        item_name      VARCHAR(100)   NOT NULL,
+        date           DATE           NOT NULL,
+        median_price   NUMERIC(14, 4) NOT NULL,
+        buy_median     NUMERIC(14, 4),
+        sell_median    NUMERIC(14, 4),
+        author_median  NUMERIC(14, 4),
+        avg_price      NUMERIC(14, 4) NOT NULL,
+        min_price      NUMERIC(14, 4) NOT NULL,
+        max_price      NUMERIC(14, 4) NOT NULL,
+        total_volume   INT            NOT NULL,
+        buy_volume     INT            NOT NULL DEFAULT 0,
+        sell_volume    INT            NOT NULL DEFAULT 0,
+        total_authors  INT            NOT NULL DEFAULT 0,
+        buy_authors    INT            NOT NULL DEFAULT 0,
+        sell_authors   INT            NOT NULL DEFAULT 0,
+        created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_item_date UNIQUE (item_name, date)
+    );
+    CREATE INDEX idx_item_date ON daily_item_prices (item_name, date DESC);
 
-INSERT INTO daily_item_prices
-    (item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
-     total_volume, buy_volume, sell_volume, created_at)
-SELECT item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
-       total_volume, buy_volume, sell_volume, created_at
-FROM _old_prices
-ORDER BY item_name, date;
+    INSERT INTO daily_item_prices
+        (item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
+         total_volume, buy_volume, sell_volume, created_at)
+    SELECT item_name, date, median_price, buy_median, sell_median, avg_price, min_price, max_price,
+           total_volume, buy_volume, sell_volume, created_at
+    FROM daily_item_prices_backup
+    ORDER BY item_name, date;
+  END IF;
+END
+$migrate$;
 
 -- 2) scrape_log menjadi per item. Semua baris lama adalah milik growscan.
 ALTER TABLE scrape_log ADD COLUMN IF NOT EXISTS item_name VARCHAR(100) NOT NULL DEFAULT 'growscan';
@@ -86,7 +103,8 @@ INSERT INTO items (item_name, label, sort_order) VALUES ('growscan', 'Growscan 9
 ON CONFLICT (item_name) DO NOTHING;
 
 -- 4) View dropdown
-CREATE OR REPLACE VIEW item_list WITH (security_invoker = true) AS
+DROP VIEW IF EXISTS item_list;
+CREATE VIEW item_list WITH (security_invoker = true) AS
 SELECT p.item_name,
        COALESCE(i.label, p.item_name)  AS label,
        COALESCE(i.sort_order, 999)     AS sort_order,
@@ -105,6 +123,10 @@ ALTER TABLE events            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE item_signals      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE scrape_log        ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "public read" ON daily_item_prices;
+DROP POLICY IF EXISTS "public read" ON items;
+DROP POLICY IF EXISTS "public read" ON events;
+DROP POLICY IF EXISTS "public read" ON item_signals;
 CREATE POLICY "public read" ON daily_item_prices FOR SELECT TO anon USING (true);
 CREATE POLICY "public read" ON items             FOR SELECT TO anon USING (true);
 CREATE POLICY "public read" ON events            FOR SELECT TO anon USING (true);
