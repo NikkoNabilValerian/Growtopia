@@ -36,6 +36,8 @@ ITEMS: dict[str, dict] = {
     # "magplant": {
     #     "label": "Magplant 5000",
     #     "aliases": ["magplant", "mag"],
+    #     "noise": [r"(magplant|mag)\s*5000"],
+    #     "bare_dl_min": 100,
     #     "seed_anchor_bgl": 15.0,   # perkiraan harga sekarang
     # },
 }
