@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS scrape_log (
     date       DATE         NOT NULL,
     offers     INT          NOT NULL DEFAULT 0,
     scraped_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    channels_key TEXT,                       -- sidik jari daftar channel yang dibaca (lihat channels.py)
     PRIMARY KEY (item_name, date)
 );
 

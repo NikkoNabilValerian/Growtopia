@@ -59,9 +59,14 @@ MIN_EXPLICIT_FOR_ANCHOR = 3
 # jadi tidak langsung dibuang: ia hanya diterima bila hasilnya sangat dekat dengan patokan harga
 # (dalam WEAK_TOLERANCE kali lipat). Tanpa patokan, angka seperti itu dibuang.
 WEAK_TOLERANCE = 1.5
-# Penawaran yang harganya lebih dari N kali lipat / kurang dari 1/N dari anchor
-# dibuang (mis. "84bgl" saat harga sebenarnya 84 DL). Berlaku juga untuk satuan eksplisit.
-ANCHOR_TOLERANCE = 5.0
+# Penawaran yang harganya lebih dari N kali lipat / kurang dari 1/N dari patokan dibuang
+# (mis. "84bgl" saat harga sebenarnya 84 DL). Berlaku juga untuk satuan eksplisit.
+# N bergantung pada UMUR patokan: patokan segar (baris tersimpan 1 hari dari hari yang diproses)
+# diperlakukan ketat, patokan lama atau tak diketahui umurnya (seed, --anchor-bgl, median
+# satuan eksplisit hari itu) lebih longgar karena harga bisa bergeser selama itu.
+ANCHOR_TOL_MIN = 2.0       # N untuk patokan berumur 0 hari
+ANCHOR_TOL_MAX = 5.0       # batas atas N
+ANCHOR_TOL_PER_DAY = 0.05  # N naik segini per hari umur patokan, sampai ANCHOR_TOL_MAX
 # Aturan statis cadangan: angka tanpa satuan >= batas ini dianggap DL, selain itu BGL.
 BARE_DL_MIN: dict[str, float] = {n: c["bare_dl_min"] for n, c in ITEMS.items() if "bare_dl_min" in c}
 DEFAULT_BARE_DL_MIN = 50
@@ -185,14 +190,26 @@ def parse_message(text: str, author: str) -> list[Offer]:
 
 # ------------------------------------------------------- penentuan satuan
 
+def anchor_value(a) -> float | None:
+    """Nilai patokan (WL) dari float atau pasangan (nilai, umur_hari)."""
+    return a[0] if isinstance(a, tuple) else a
+
+
+def anchor_tolerance(age_days: int | None) -> float:
+    if age_days is None:
+        return ANCHOR_TOL_MAX
+    return min(ANCHOR_TOL_MAX, ANCHOR_TOL_MIN + ANCHOR_TOL_PER_DAY * max(age_days, 0))
+
+
 def _log_dist(a: float, b: float) -> float:
     return abs(math.log10(a / b))
 
 
-def resolve_offers(offers: list[Offer], anchors: dict[str, float | None] | None = None) -> list[Resolved]:
+def resolve_offers(offers: list[Offer], anchors: dict | None = None) -> list[Resolved]:
     """Ubah angka mentah menjadi harga dalam WL.
 
-    anchors: {item: level harga dalam WL} dari harga tersimpan terdekat (boleh kosong).
+    anchors: {item: patokan} dengan patokan berupa level harga dalam WL (umur tak diketahui)
+    atau pasangan (WL, umur_hari) dari harga tersimpan terdekat. Boleh kosong.
     """
     anchors = anchors or {}
     by_item: dict[str, list[Offer]] = defaultdict(list)
@@ -201,11 +218,14 @@ def resolve_offers(offers: list[Offer], anchors: dict[str, float | None] | None 
 
     out: list[Resolved] = []
     for item, offs in by_item.items():
-        anchor = anchors.get(item)
+        raw = anchors.get(item)
+        anchor = anchor_value(raw)
+        age = raw[1] if isinstance(raw, tuple) else None   # None = umur tak diketahui -> toleransi longgar
         if not anchor:
             explicit = [o.value * WL_PER_UNIT[o.unit] for o in offs if o.unit]
             if len(explicit) >= MIN_EXPLICIT_FOR_ANCHOR:
                 anchor = median(explicit)
+        tol_anchor = anchor_tolerance(age)
 
         for o in offs:
             if o.unit:
@@ -220,7 +240,7 @@ def resolve_offers(offers: list[Offer], anchors: dict[str, float | None] | None 
                 unit = "dl" if o.value >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
                 wl, how = o.value * WL_PER_UNIT[unit], "bare-statis"
 
-            tol = WEAK_TOLERANCE if (o.weak and not o.unit) else ANCHOR_TOLERANCE
+            tol = WEAK_TOLERANCE if (o.weak and not o.unit) else tol_anchor
             if anchor and _log_dist(wl, anchor) > math.log10(tol):
                 out.append(Resolved(o, None, "dibuang"))
                 continue
@@ -257,7 +277,7 @@ def _segment(prices: list[float], center: float) -> tuple[float | None, int]:
 
 
 def summarize_day(
-    offers: list[Offer], day: str, anchors: dict[str, float | None] | None = None
+    offers: list[Offer], day: str, anchors: dict | None = None
 ) -> list[dict]:
     """Ubah semua penawaran satu hari menjadi 1 baris ringkasan per item.
 

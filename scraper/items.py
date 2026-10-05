@@ -18,6 +18,8 @@ Isi tiap entri:
                    angka dan bukan harga, mis. "Growscan 9000" -> dibaca "growscan"
   bare_dl_min      (opsional) aturan cadangan untuk angka tanpa satuan: >= nilai ini
                    dianggap DL, di bawahnya BGL. Hanya dipakai bila tidak ada patokan harga.
+  channels         (opsional) nama kelompok channel dari channels.py, atau daftar nama
+                   ["rare", "tools"]. Default "default" (= DISCORD_CHANNEL_IDS).
   seed_anchor_bgl  (opsional, sangat disarankan) perkiraan harga item SEKARANG dalam BGL.
                    Dipakai sebagai titik awal hanya selama item belum punya data sama sekali.
                    Tanpa ini, hari paling baru bisa salah menentukan satuan dan kesalahan
@@ -30,14 +32,14 @@ ITEMS: dict[str, dict] = {
         "aliases": ["growscan", "gscan", "gs"],
         "noise": [r"(growscan|gscan)\s*9000"],
         "bare_dl_min": 50,
+        "channels": "default",          # kelompok channel (lihat channels.py)
         "seed_anchor_bgl": 6.0,
     },
     # Contoh item berikutnya (hapus tanda # lalu sesuaikan):
     # "magplant": {
     #     "label": "Magplant 5000",
     #     "aliases": ["magplant", "mag"],
-    #     "noise": [r"(magplant|mag)\s*5000"],
-    #     "bare_dl_min": 100,
+    #     "channels": "tools",       # kelompok channel khusus item ini
     #     "seed_anchor_bgl": 15.0,   # perkiraan harga sekarang
     # },
 }

@@ -10,6 +10,8 @@ Pemakaian:
     python pipeline.py --backfill 2023-01-01 2026-10-03 --oldest-first
     python pipeline.py --backfill 2021-01-01 2026-09-25 --every 45   # tahap kerangka (titik acuan)
     python pipeline.py --backfill ... --items magplant,growscan      # hanya item tertentu
+    python pipeline.py --backfill ... --group tools   # semua item yang memakai kelompok channel "tools"
+    python pipeline.py --stamp-log                    # sekali saja setelah migrasi 004 (lihat channels.py)
     python pipeline.py --date 2023-04-20 --dry-run  # hitung & tampilkan, TANPA menyimpan
     python pipeline.py --date 2023-04-20 --dry-run --anchor-bgl 0.2   # uji dengan perkiraan harga sebenarnya
     python pipeline.py --backfill 2023-01-01 2026-10-03 --force   # proses ulang walau sudah pernah
@@ -25,7 +27,8 @@ run berikutnya (kecuali --force). Hari ini (belum lengkap) tidak pernah dicatat.
 
 Environment variables:
     DISCORD_USER_TOKEN     token akun tumbal (simpan di .env / env var, JANGAN di-commit)
-    DISCORD_CHANNEL_IDS    id channel, pisahkan dengan koma
+    DISCORD_CHANNEL_IDS    id channel untuk kelompok "default", pisahkan dengan koma
+                           (kelompok lain didefinisikan di channels.py)
     SUPABASE_URL
     SUPABASE_SERVICE_KEY   secret key (jangan dipakai di frontend)
     TZ_NAME                default Asia/Jakarta
@@ -48,10 +51,12 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client
 
+from channels import channel_key, item_channels, item_groups
 from items import ITEMS
 from offer_parser import (
     ITEM_LABELS,
     SIDE_BAND,
+    anchor_value,
     Offer,
     mentions_tracked,
     parse_message,
@@ -151,10 +156,27 @@ def iter_messages(dc: DiscordClient, channel_ids: list[int], day: date) -> Itera
         _time.sleep(DELAY)
 
 
-def fetch_day(dc: DiscordClient, channel_ids: list[int], day: date) -> list[Offer]:
+def build_plan(items: list[str], channels_of: dict[str, list[int]]) -> dict[int, set[str]]:
+    """channel -> item yang dicari di channel itu. Setiap channel dibaca SEKALI per hari,
+    walau dipakai banyak item."""
+    plan: dict[int, set[str]] = {}
+    for item in items:
+        for cid in channels_of[item]:
+            plan.setdefault(cid, set()).add(item)
+    return plan
+
+
+def fetch_day(dc: DiscordClient, plan: dict[int, set[str]], day: date) -> list[Offer]:
+    start = datetime.combine(day, time.min, tzinfo=TZ)
+    end = start + timedelta(days=1)
     offers: list[Offer] = []
-    for m in iter_messages(dc, channel_ids, day):
-        offers.extend(parse_message(m["content"], m["author"]["id"]))
+    for cid, wanted in plan.items():
+        for m in dc.messages_between(cid, start, end):
+            if m["author"].get("bot") or not m.get("content"):
+                continue
+            # hanya item milik channel ini (sesuai kelompok channel item tersebut)
+            offers.extend(o for o in parse_message(m["content"], m["author"]["id"]) if o.item in wanted)
+        _time.sleep(DELAY)
     return offers  # data mentah hanya hidup di memori, per hari
 
 
@@ -195,20 +217,51 @@ def today_local() -> date:
 
 # ----------------------------------------------------------- scrape_log per item
 
-def logged_days(sb, items: list[str], start: date, end: date) -> dict[str, set[date]]:
-    """Tanggal dalam [start, end] yang sudah selesai, per item."""
+def log_has_key(sb) -> bool:
+    """Apakah scrape_log sudah punya kolom channels_key (migrasi 004)?"""
+    try:
+        sb.table(LOG_TABLE).select("channels_key").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def logged_days(sb, items: list[str], keys: dict[str, str], start: date, end: date,
+                use_keys: bool) -> tuple[dict[str, set[date]], dict[str, int]]:
+    """Hari yang sudah selesai per item dalam [start, end].
+
+    Dengan use_keys, hari yang dicatat memakai daftar channel LAIN (kelompok channel item itu
+    berubah) dianggap belum selesai. Baris lama tanpa sidik jari (NULL) dianggap selesai.
+    Mengembalikan (hari selesai, jumlah hari usang per item).
+    """
     done: dict[str, set[date]] = {i: set() for i in items}
+    stale: dict[str, int] = {i: 0 for i in items}
+    cols = "date, channels_key" if use_keys else "date"
     for item in items:
         for offset in range(0, 1_000_000, 1000):
             data = (
-                sb.table(LOG_TABLE).select("date").eq("item_name", item)
+                sb.table(LOG_TABLE).select(cols).eq("item_name", item)
                 .gte("date", start.isoformat()).lte("date", end.isoformat())
                 .order("date").range(offset, offset + 999).execute().data
             )
-            done[item].update(date.fromisoformat(r["date"]) for r in data)
+            for r in data:
+                k = r.get("channels_key")
+                if use_keys and k is not None and k != keys[item]:
+                    stale[item] += 1
+                    continue
+                done[item].add(date.fromisoformat(r["date"]))
             if len(data) < 1000:
                 break
-    return done
+    return done, stale
+
+
+def stamp_log(sb, items: list[str], keys: dict[str, str]) -> None:
+    """Beri sidik jari channel pada baris scrape_log lama (NULL). Jalankan sekali setelah
+    migrasi 004, SEBELUM mengubah isi kelompok channel."""
+    for item in items:
+        res = (sb.table(LOG_TABLE).update({"channels_key": keys[item]})
+               .eq("item_name", item).is_("channels_key", "null").execute())
+        print(f"[{item}] {len(res.data or [])} baris scrape_log diberi sidik jari channel {keys[item]}")
 
 
 def last_logged_day(sb, item: str) -> date | None:
@@ -233,7 +286,7 @@ def sync_items(sb, items: list[str]) -> None:
 
 # ------------------------------------------------------------------- anchor
 
-def fetch_anchor(sb, item: str, day: date, side: str) -> float | None:
+def fetch_anchor(sb, item: str, day: date, side: str) -> tuple[float, int] | None:
     """Level harga (dalam WL) dari baris tersimpan terdekat, dipakai untuk menentukan
     satuan angka tanpa satuan.
 
@@ -255,8 +308,8 @@ def fetch_anchor(sb, item: str, day: date, side: str) -> float | None:
     found = [f for f in found if f and abs((f[0] - day).days) <= MAX_ANCHOR_AGE_DAYS]
     if not found:
         return None
-    _, median_bgl = min(found, key=lambda f: abs((f[0] - day).days))
-    return median_bgl * 10_000  # BGL -> WL
+    row_day, median_bgl = min(found, key=lambda f: abs((f[0] - day).days))
+    return median_bgl * 10_000, abs((row_day - day).days)  # (BGL -> WL, umur patokan dalam hari)
 
 
 def make_seeds(sb, items: list[str]) -> dict[str, float]:
@@ -269,23 +322,25 @@ def make_seeds(sb, items: list[str]) -> dict[str, float]:
 
 
 def get_anchors(sb, items: list[str], day: date, side: str, override_bgl: float | None,
-                seeds: dict[str, float]) -> dict[str, float | None]:
+                seeds: dict[str, float]) -> dict:
     if override_bgl:  # anchor manual dari --anchor-bgl, berlaku untuk semua item
         return {i: override_bgl * 10_000 for i in items}
     return {i: fetch_anchor(sb, i, day, side) or seeds.get(i) for i in items}
 
 
-def dry_run_day(sb, dc: DiscordClient, channel_ids: list[int], day: date, side: str,
+def dry_run_day(sb, dc: DiscordClient, channels_of: dict[str, list[int]], day: date, side: str,
                 items: list[str], override_bgl: float | None, seeds: dict[str, float]) -> None:
     """Jalankan seluruh perhitungan untuk satu hari dan tampilkan hasilnya, tanpa menyimpan."""
     anchors = get_anchors(sb, items, day, side, override_bgl, seeds)
-    offers = [o for o in fetch_day(dc, channel_ids, day) if o.item in items]
+    offers = fetch_day(dc, build_plan(items, channels_of), day)
     resolved = resolve_offers(offers, anchors)
 
     print(f"\n=== {day} (DRY RUN, tidak ada yang disimpan) ===")
     for item in items:
-        a = anchors.get(item)
-        print(f"[{item}] anchor: " + (f"{a / 10_000:.4g} BGL" if a else "tidak ada (pakai satuan eksplisit / aturan statis)"))
+        a = anchor_value(anchors.get(item))
+        raw_a = anchors.get(item)
+        umur = f", umur {raw_a[1]} hari" if isinstance(raw_a, tuple) else ", umur tak diketahui (toleransi longgar)"
+        print(f"[{item}] anchor: " + (f"{a / 10_000:.4g} BGL{umur}" if a else "tidak ada (pakai satuan eksplisit / aturan statis)"))
         mine = [r for r in resolved if r.offer.item == item]
         print(f"[{item}] hasil penentuan satuan:", dict(Counter(r.how for r in mine)))
         dropped = [r.offer for r in mine if r.price_wl is None][:8]
@@ -301,13 +356,17 @@ def dry_run_day(sb, dc: DiscordClient, channel_ids: list[int], day: date, side: 
 
     # Diagnosis: pesan mentah yang harganya jauh dari median hari itu atau dibuang.
     centers = {r["item_name"]: r["median_price"] for r in rows}
+    for item in items:  # patokan lebih dapat dipercaya daripada median hari itu (yang bisa saja salah)
+        av = anchor_value(anchors.get(item))
+        if av:
+            centers[item] = av / 10_000
     far = []
     for r in resolved:
         c = centers.get(r.offer.item)
         if r.price_wl is None:
             far.append((r, "DIBUANG (jauh dari patokan)"))
         elif c and not (c / SIDE_BAND <= r.price_wl / 10_000 <= c * SIDE_BAND):
-            far.append((r, f"jauh dari median {c:.4g} BGL"))
+            far.append((r, f"jauh dari patokan/median {c:.4g} BGL"))
     if far:
         print(f"\nPesan yang harganya mencurigakan ({len(far)} total, maks. 15 ditampilkan):")
         for r, why in far[:15]:
@@ -321,6 +380,9 @@ def main():
     ap.add_argument("--date", type=date.fromisoformat)
     ap.add_argument("--backfill", nargs=2, type=date.fromisoformat, metavar=("FROM", "TO"))
     ap.add_argument("--items", help="daftar item dipisah koma (default: semua item di items.py)")
+    ap.add_argument("--group", help="hanya item yang memakai kelompok channel ini (lihat channels.py)")
+    ap.add_argument("--stamp-log", action="store_true",
+                    help="beri sidik jari channel pada baris scrape_log lama, lalu keluar (sekali, setelah migrasi 004)")
     ap.add_argument("--oldest-first", action="store_true",
                     help="backfill dari terlama ke terbaru (default: terbaru ke terlama)")
     ap.add_argument("--dry-run", action="store_true",
@@ -346,18 +408,33 @@ def main():
         if unknown:
             raise SystemExit(f"Item tidak dikenal: {unknown}. Item yang ada di items.py: {list(ITEMS)}")
 
+    if args.group:
+        items = [i for i in items if args.group in item_groups(ITEMS[i])]
+        if not items:
+            raise SystemExit(f"Tidak ada item yang memakai kelompok channel '{args.group}'.")
+
     today = today_local()
     yesterday = today - timedelta(days=1)
 
+    channels_of = {i: item_channels(ITEMS[i]) for i in items}   # item -> channel (dari kelompoknya)
+    keys = {i: channel_key(channels_of[i]) for i in items}      # sidik jari daftar channel per item
+    all_channels = sorted({c for ids in channels_of.values() for c in ids})
+
     dc = DiscordClient(os.environ["DISCORD_USER_TOKEN"])
-    channel_ids = [int(c) for c in os.environ["DISCORD_CHANNEL_IDS"].split(",")]
 
     if args.sample:
         day = args.date or (args.backfill[0] if args.backfill else yesterday)
-        show_sample(dc, channel_ids, day, args.sample)
+        show_sample(dc, all_channels, day, args.sample)
         return
 
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    use_keys = log_has_key(sb)
+
+    if args.stamp_log:
+        if not use_keys:
+            raise SystemExit("Kolom scrape_log.channels_key belum ada. Jalankan migrasi 004 dulu.")
+        stamp_log(sb, items, keys)
+        return
 
     if args.backfill:
         days = list(daterange(*args.backfill))
@@ -379,7 +456,7 @@ def main():
 
     if args.dry_run:
         for day in days:
-            dry_run_day(sb, dc, channel_ids, day, side, items, args.anchor_bgl, seeds)
+            dry_run_day(sb, dc, channels_of, day, side, items, args.anchor_bgl, seeds)
         return
 
     # pending[hari] = item yang belum selesai di hari itu
@@ -392,7 +469,10 @@ def main():
             days = [d for d in days if d < today]
         pending = {d: list(items) for d in days}
         if days:
-            done = logged_days(sb, items, min(days), max(days))
+            done, stale = logged_days(sb, items, keys, min(days), max(days), use_keys)
+            for item, n in stale.items():
+                if n:
+                    print(f"[{item}] {n} hari dicatat dengan daftar channel LAMA; dikerjakan ulang dengan daftar channel sekarang.")
             pending = {d: [i for i in items if d not in done[i]] for d in days}
             skipped = sum(1 for d in days if not pending[d])
             if skipped:
@@ -405,8 +485,9 @@ def main():
         return
     sync_items(sb, items)
     print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} "
-          f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: {', '.join(items)}, "
-          f"{len(channel_ids)} channel", flush=True)
+          f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: "
+          f"{', '.join(f'{i}[{chr(43).join(item_groups(ITEMS[i]))}]' for i in items)}, "
+          f"{len(all_channels)} channel", flush=True)
 
     started = _time.monotonic()
     remaining = 0
@@ -421,12 +502,11 @@ def main():
         todo = pending[day]
         anchors = get_anchors(sb, todo, day, side, args.anchor_bgl, seeds)
         try:
-            all_offers = fetch_day(dc, channel_ids, day)
+            offers = fetch_day(dc, build_plan(todo, channels_of), day)
         except TransientError as e:
             failed += 1
             print(f"{day}: GAGAL sementara ({e}). Dilewati, akan dicoba lagi di run berikutnya.", flush=True)
             continue
-        offers = [o for o in all_offers if o.item in todo]
         rows = summarize_day(offers, day.isoformat(), anchors)
         if rows:
             sb.table(TABLE).upsert(rows, on_conflict="item_name,date").execute()
@@ -439,7 +519,8 @@ def main():
         counts = Counter(o.item for o in offers)
         if day < today:  # hari yang belum selesai tidak dicatat, supaya diulang besok
             sb.table(LOG_TABLE).upsert(
-                [{"item_name": item, "date": day.isoformat(), "offers": counts.get(item, 0)} for item in todo],
+                [{"item_name": item, "date": day.isoformat(), "offers": counts.get(item, 0),
+                  **({"channels_key": keys[item]} if use_keys else {})} for item in todo],
                 on_conflict="item_name,date",
             ).execute()
         succeeded += 1
