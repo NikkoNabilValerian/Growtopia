@@ -55,6 +55,10 @@ NOISE_PATTERNS = [
 #   3. aturan statis di bawah (hanya jika tidak ada anchor sama sekali).
 # Angka tanpa satuan dijadikan WL / DL / BGL, mana yang paling dekat dengan anchor.
 MIN_EXPLICIT_FOR_ANCHOR = 3
+# Angka tanpa satuan yang didahului kata jumlah ("NEED 2", "qty 3") bisa saja harga ("want 550"),
+# jadi tidak langsung dibuang: ia hanya diterima bila hasilnya sangat dekat dengan patokan harga
+# (dalam WEAK_TOLERANCE kali lipat). Tanpa patokan, angka seperti itu dibuang.
+WEAK_TOLERANCE = 1.5
 # Penawaran yang harganya lebih dari N kali lipat / kurang dari 1/N dari anchor
 # dibuang (mis. "84bgl" saat harga sebenarnya 84 DL). Berlaku juga untuk satuan eksplisit.
 ANCHOR_TOLERANCE = 5.0
@@ -95,6 +99,7 @@ ALIAS_RE = re.compile(
     re.I,
 )
 # Angka tanpa satuan yang diikuti kata jumlah barang ("2 pcs") adalah jumlah, bukan harga.
+QTY_BEFORE_RE = re.compile(r"(?:need|needs|want|wants|qty|quantity|stock|butuh)\W*$", re.I)
 QTY_AFTER_RE = re.compile(r"\s*(?:pcs?|pieces?|biji|buah|units?)(?![a-z])", re.I)
 PRICE_RE = re.compile(
     r"(?<![\w.,])(?P<num>\d+(?:[.,]\d{1,2})?)\s*(?:(?P<unit>bgl|dl|wl)s?)?(?![a-z0-9])",
@@ -109,6 +114,7 @@ class Offer:
     value: float           # angka mentah seperti yang diketik
     unit: str | None       # "wl" | "dl" | "bgl" | None (tanpa satuan)
     author: str
+    weak: bool = False     # angka tanpa satuan yang didahului kata jumlah ("need 2"): harus cocok dengan patokan
     raw: str = field(default="", compare=False)   # baris pesan asli, hanya untuk diagnosis
 
 
@@ -162,6 +168,7 @@ def parse_message(text: str, author: str) -> list[Offer]:
         value = float(price["num"].replace(",", "."))
         if value <= 0:
             continue
+        weak = not price["unit"] and bool(QTY_BEFORE_RE.search(line[: price.start()]))
         offers.append(
             Offer(
                 item=ALIAS_TO_ITEM[last[0].lower()],
@@ -169,6 +176,7 @@ def parse_message(text: str, author: str) -> list[Offer]:
                 value=value,
                 unit=(price["unit"] or "").lower() or None,
                 author=author,
+                weak=weak,
                 raw=line.strip()[:200],
             )
         )
@@ -206,10 +214,14 @@ def resolve_offers(offers: list[Offer], anchors: dict[str, float | None] | None 
                 unit = min(WL_PER_UNIT, key=lambda u: _log_dist(o.value * WL_PER_UNIT[u], anchor))
                 wl, how = o.value * WL_PER_UNIT[unit], f"bare->{unit}"
             else:
+                if o.weak:  # tanpa patokan, angka ambigu seperti "need 2" tidak bisa dipercaya
+                    out.append(Resolved(o, None, "dibuang"))
+                    continue
                 unit = "dl" if o.value >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
                 wl, how = o.value * WL_PER_UNIT[unit], "bare-statis"
 
-            if anchor and _log_dist(wl, anchor) > math.log10(ANCHOR_TOLERANCE):
+            tol = WEAK_TOLERANCE if (o.weak and not o.unit) else ANCHOR_TOLERANCE
+            if anchor and _log_dist(wl, anchor) > math.log10(tol):
                 out.append(Resolved(o, None, "dibuang"))
                 continue
             out.append(Resolved(o, wl, how))

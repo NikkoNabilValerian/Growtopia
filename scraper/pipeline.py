@@ -405,7 +405,8 @@ def main():
         return
     sync_items(sb, items)
     print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} "
-          f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: {', '.join(items)}", flush=True)
+          f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: {', '.join(items)}, "
+          f"{len(channel_ids)} channel", flush=True)
 
     started = _time.monotonic()
     remaining = 0
