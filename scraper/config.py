@@ -17,7 +17,7 @@
 # Developer Mode, lalu klik kanan channel -> Copy Channel ID.
 # (Boleh dikosongkan: item tanpa `_channel` memakai DISCORD_CHANNEL_IDS seperti cara lama.)
 
-# CH_RARE_ITEMS = 782718904056807494      # #buy-sell-rare-items
+CH_GROWSCAN = 900836866373333052,782718904056807494,900860787298553877      # #buy-sell-rare-items
 # CH_TOOLS      = 111111111111111111      # contoh
 
 
@@ -45,7 +45,7 @@ growscan_nama        = "Growscan 9000"
 growscan_alias       = "growscan, gscan, gs"
 growscan_alias_lemah = "gs"
 growscan_nama_angka  = "9000"
-# growscan_channel   = CH_RARE_ITEMS
+growscan_channel   = CH_GROWSCAN
 growscan_harga       = 6
 
 # ---- Contoh item berikutnya (hapus tanda # di depan tiap baris, lalu sesuaikan)
