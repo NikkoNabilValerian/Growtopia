@@ -108,15 +108,17 @@ def _channel_label(cfg: dict) -> str:
 
 def describe() -> str:
     lines = ["ITEM (aktif = ikut saat tidak ada pilihan)", ""]
-    lines.append(f"  {'nama':<12}{'aktif':<7}{'label':<22}{'channel':<34}sidik jari")
+    lines.append(f"  {'nama':<12}{'aktif':<7}{'label':<22}{'channel':<30}{'sidik jari':<14}alias")
     for name, cfg in ITEMS.items():
         try:
             key = channel_key(item_channels(cfg))
         except SystemExit:
             key = "-"
+        weak = cfg.get("weak_aliases", [])
+        alias = ", ".join(a + (" (lemah)" if a in weak else "") for a in cfg["aliases"])
         lines.append(
             f"  {name:<12}{('ya' if cfg.get('enabled', True) else 'tidak'):<7}{cfg.get('label', name):<22}"
-            f"{_channel_label(cfg):<34}{key}"
+            f"{_channel_label(cfg):<30}{key:<14}{alias}"
         )
     lines += ["", "CHANNEL YANG DIDEFINISIKAN"]
     lines += [f"  {n} = {i}" for i, n in CHANNEL_NAMES.items()] or ["  (belum ada; item memakai DISCORD_CHANNEL_IDS)"]

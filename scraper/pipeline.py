@@ -281,6 +281,12 @@ def sync_items(sb, items: list[str]) -> None:
         rows = [{"item_name": n, "label": ITEM_LABELS[n], "sort_order": i}
                 for i, n in enumerate(ITEMS) if n in items]
         sb.table("items").upsert(rows, on_conflict="item_name").execute()
+        known = {r["item_name"] for r in sb.table("items").select("item_name").execute().data}
+        orphans = sorted(known - set(ITEMS))
+        if orphans:
+            print(f"[peringatan] item ada di database tetapi TIDAK ada di config.py: {', '.join(orphans)}. "
+                  f"Kalau sisa data lama, hapus dengan SQL (lihat supabase/queries/remove_item.sql); "
+                  f"kalau memang masih dipakai, tambahkan ke config.py.", flush=True)
     except Exception as e:  # tabel belum dimigrasi: jangan hentikan scrape
         print(f"[peringatan] sinkronisasi tabel items dilewati ({type(e).__name__}).", flush=True)
 
