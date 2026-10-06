@@ -90,6 +90,13 @@ ACTIONS = {
 ACTION_RE = re.compile(r"(?<![a-z0-9])(sell|selling|wts|buy|buying|wtb)(?![a-z0-9])", re.I)
 EMOJI_RE = re.compile(r"<a?:(\w+):(\d+)>")
 
+WEAK_ALIASES: set[str] = set()
+for _item, _cfg in ITEMS.items():
+    for _w in _cfg.get("weak_aliases", []):
+        if _w.lower() not in [a.lower() for a in _cfg["aliases"]]:
+            raise ValueError(f"weak_aliases '{_w}' bukan salah satu alias item {_item} (items.py)")
+        WEAK_ALIASES.add(_w.lower())
+
 ALIAS_TO_ITEM: dict[str, str] = {}
 for _item, _aliases in TRACKED_ITEMS.items():
     for _a in _aliases:
@@ -105,7 +112,9 @@ ALIAS_RE = re.compile(
 )
 # Angka tanpa satuan yang diikuti kata jumlah barang ("2 pcs") adalah jumlah, bukan harga.
 QTY_BEFORE_RE = re.compile(r"(?:need|needs|want|wants|qty|quantity|stock|butuh)\W*$", re.I)
-QTY_AFTER_RE = re.compile(r"\s*(?:pcs?|pieces?|biji|buah|units?)(?![a-z])", re.I)
+QTY_AFTER_RE = re.compile(
+    r"\s*(?:pcs?|pieces?|biji|buah|units?|worlds?(?!\s*locks?)|items?|days?|hari|hours?|jam)(?![a-z])", re.I
+)
 PRICE_RE = re.compile(
     r"(?<![\w.,])(?P<num>\d+(?:[.,]\d{1,2})?)\s*(?:(?P<unit>bgl|dl|wl)s?)?(?![a-z0-9])",
     re.I,
@@ -166,6 +175,11 @@ def parse_message(text: str, author: str) -> list[Offer]:
             m for m in PRICE_RE.finditer(line, last.end())
             if m["unit"] or not QTY_AFTER_RE.match(line, m.end())
         ]
+        # Bila item ini hanya disebut lewat alias lemah ("gs"), angka tanpa satuan tidak dipercaya.
+        last_item = ALIAS_TO_ITEM[last[0].lower()]
+        mentions = [m[0].lower() for m in aliases if ALIAS_TO_ITEM[m[0].lower()] == last_item]
+        if all(a in WEAK_ALIASES for a in mentions):
+            cands = [m for m in cands if m["unit"]]
         if not cands:
             continue
         price = next((m for m in cands if m["unit"]), cands[0])

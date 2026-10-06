@@ -18,6 +18,10 @@ Isi tiap entri:
                    angka dan bukan harga, mis. "Growscan 9000" -> dibaca "growscan"
   bare_dl_min      (opsional) aturan cadangan untuk angka tanpa satuan: >= nilai ini
                    dianggap DL, di bawahnya BGL. Hanya dipakai bila tidak ada patokan harga.
+  weak_aliases     (opsional) alias yang ambigu (singkatan pendek yang bisa berarti hal lain,
+                   mis. "gs"). Pesan yang HANYA memuat alias lemah baru dihitung bila harganya
+                   punya satuan eksplisit (bgl/dl/wl atau emoji). Angka tanpa satuan diabaikan,
+                   karena sering bukan harga ("sell atm have gs (have 2 world)").
   channels         (opsional) nama kelompok channel dari channels.py, atau daftar nama
                    ["rare", "tools"]. Default "default" (= DISCORD_CHANNEL_IDS).
   seed_anchor_bgl  (opsional, sangat disarankan) perkiraan harga item SEKARANG dalam BGL.
@@ -30,6 +34,7 @@ ITEMS: dict[str, dict] = {
     "growscan": {
         "label": "Growscan 9000",
         "aliases": ["growscan", "gscan", "gs"],
+        "weak_aliases": ["gs"],
         "noise": [r"(growscan|gscan)\s*9000"],
         "bare_dl_min": 50,
         "channels": "default",          # kelompok channel (lihat channels.py)

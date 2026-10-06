@@ -486,7 +486,7 @@ def main():
     sync_items(sb, items)
     print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} "
           f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: "
-          f"{', '.join(f'{i}[{chr(43).join(item_groups(ITEMS[i]))}]' for i in items)}, "
+          f"{', '.join(f'{i}[{chr(43).join(item_groups(ITEMS[i]))}:{keys[i]}]' for i in items)}, "
           f"{len(all_channels)} channel", flush=True)
 
     started = _time.monotonic()
