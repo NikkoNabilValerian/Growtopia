@@ -1,6 +1,6 @@
 """Module 2: Discord (akun tumbal) -> parse -> ringkas -> upsert ke Supabase.
 
-Item yang dipantau dikonfigurasi di items.py. Satu kali membaca pesan Discord melayani
+Item yang dipantau dikonfigurasi di config.py. Satu kali membaca pesan Discord melayani
 SEMUA item, jadi menambah item hampir tidak menambah waktu scrape.
 
 Pemakaian:
@@ -10,8 +10,9 @@ Pemakaian:
     python pipeline.py --backfill 2023-01-01 2026-10-03 --oldest-first
     python pipeline.py --backfill 2021-01-01 2026-09-25 --every 45   # tahap kerangka (titik acuan)
     python pipeline.py --backfill ... --items magplant,growscan      # hanya item tertentu
-    python pipeline.py --backfill ... --group tools   # semua item yang memakai kelompok channel "tools"
-    python pipeline.py --stamp-log                    # sekali saja setelah migrasi 004 (lihat channels.py)
+    python pipeline.py --backfill ... --items preset:harian          # preset di config.py
+    python pipeline.py --list                         # tampilkan isi config.py (item, channel, preset)
+    python pipeline.py --stamp-log                    # sekali saja setelah migrasi 004 (lihat config.py)
     python pipeline.py --date 2023-04-20 --dry-run  # hitung & tampilkan, TANPA menyimpan
     python pipeline.py --date 2023-04-20 --dry-run --anchor-bgl 0.2   # uji dengan perkiraan harga sebenarnya
     python pipeline.py --backfill 2023-01-01 2026-10-03 --force   # proses ulang walau sudah pernah
@@ -28,7 +29,7 @@ run berikutnya (kecuali --force). Hari ini (belum lengkap) tidak pernah dicatat.
 Environment variables:
     DISCORD_USER_TOKEN     token akun tumbal (simpan di .env / env var, JANGAN di-commit)
     DISCORD_CHANNEL_IDS    id channel untuk kelompok "default", pisahkan dengan koma
-                           (kelompok lain didefinisikan di channels.py)
+                           (kelompok lain didefinisikan di config.py)
     SUPABASE_URL
     SUPABASE_SERVICE_KEY   secret key (jangan dipakai di frontend)
     TZ_NAME                default Asia/Jakarta
@@ -51,8 +52,8 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client
 
-from channels import channel_key, item_channels, item_groups
-from items import ITEMS
+from selection import channel_key, describe, item_channels, resolve_selection
+from settings import ITEMS
 from offer_parser import (
     ITEM_LABELS,
     SIDE_BAND,
@@ -275,7 +276,7 @@ def item_has_rows(sb, item: str) -> bool:
 
 
 def sync_items(sb, items: list[str]) -> None:
-    """Salin label item dari items.py ke tabel items agar website bisa menampilkannya."""
+    """Salin label item dari config.py ke tabel items agar website bisa menampilkannya."""
     try:
         rows = [{"item_name": n, "label": ITEM_LABELS[n], "sort_order": i}
                 for i, n in enumerate(ITEMS) if n in items]
@@ -313,7 +314,7 @@ def fetch_anchor(sb, item: str, day: date, side: str) -> tuple[float, int] | Non
 
 
 def make_seeds(sb, items: list[str]) -> dict[str, float]:
-    """Patokan awal (WL) dari items.py, hanya untuk item yang belum punya data sama sekali."""
+    """Patokan awal (WL) dari config.py, hanya untuk item yang belum punya data sama sekali."""
     return {
         i: ITEMS[i]["seed_anchor_bgl"] * 10_000
         for i in items
@@ -379,8 +380,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", type=date.fromisoformat)
     ap.add_argument("--backfill", nargs=2, type=date.fromisoformat, metavar=("FROM", "TO"))
-    ap.add_argument("--items", help="daftar item dipisah koma (default: semua item di items.py)")
-    ap.add_argument("--group", help="hanya item yang memakai kelompok channel ini (lihat channels.py)")
+    ap.add_argument("--items", help="pilihan item dipisah koma: nama, preset:NAMA, atau all "
+                                    "(default: semua item aktif di config.py)")
+    ap.add_argument("--list", action="store_true", help="tampilkan isi config.py lalu keluar")
     ap.add_argument("--stamp-log", action="store_true",
                     help="beri sidik jari channel pada baris scrape_log lama, lalu keluar (sekali, setelah migrasi 004)")
     ap.add_argument("--oldest-first", action="store_true",
@@ -401,17 +403,15 @@ def main():
                     help="tampilkan N pesan mentah + hasil parsing, tanpa menyimpan ke Supabase")
     args = ap.parse_args()
 
-    items = list(ITEMS)
-    if args.items:
-        items = [i.strip() for i in args.items.split(",") if i.strip()]
-        unknown = [i for i in items if i not in ITEMS]
-        if unknown:
-            raise SystemExit(f"Item tidak dikenal: {unknown}. Item yang ada di items.py: {list(ITEMS)}")
-
-    if args.group:
-        items = [i for i in items if args.group in item_groups(ITEMS[i])]
-        if not items:
-            raise SystemExit(f"Tidak ada item yang memakai kelompok channel '{args.group}'.")
+    if args.list:
+        print(describe())
+        return
+    try:
+        items = resolve_selection(args.items)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if not items:
+        raise SystemExit("Tidak ada item aktif. Aktifkan item di config.py ('enabled': True) atau sebut namanya lewat --items.")
 
     today = today_local()
     yesterday = today - timedelta(days=1)
@@ -486,7 +486,7 @@ def main():
     sync_items(sb, items)
     print(f"Memproses {len(days)} hari: {days[0]} lalu {days[-1]} "
           f"(urutan {'terlama' if days[0] < days[-1] else 'terbaru'} dulu), item: "
-          f"{', '.join(f'{i}[{chr(43).join(item_groups(ITEMS[i]))}:{keys[i]}]' for i in items)}, "
+          f"{', '.join(f'{i}[{keys[i]}]' for i in items)}, "
           f"{len(all_channels)} channel", flush=True)
 
     started = _time.monotonic()

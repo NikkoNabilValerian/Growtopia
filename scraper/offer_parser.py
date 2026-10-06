@@ -1,6 +1,6 @@
 """Module 1: parser pesan Discord Growtopia + penghitung ringkasan harian.
 
-Hanya item di items.py yang diproses. Pesan dibaca per baris, jadi satu
+Hanya item di config.py yang diproses. Pesan dibaca per baris, jadi satu
 pesan berisi beberapa baris "Sell ..." dihitung sebagai beberapa penawaran.
 
 Satuan harga (WL / DL / BGL) TIDAK diputuskan saat parsing. Parser hanya mencatat
@@ -21,8 +21,8 @@ from statistics import mean, median, quantiles
 # 1 BGL = 100 DL = 10.000 WL. Semua harga dihitung dalam WL dulu.
 WL_PER_UNIT = {"wl": 1, "dl": 100, "bgl": 10_000}
 
-# Item yang dipantau dibaca dari items.py (satu-satunya file yang diubah untuk menambah item).
-from items import ITEMS
+# Item yang dipantau dibaca dari config.py (satu-satunya file yang diubah untuk menambah item).
+from settings import ITEMS
 
 TRACKED_ITEMS: dict[str, list[str]] = {name: cfg["aliases"] for name, cfg in ITEMS.items()}
 ITEM_LABELS: dict[str, str] = {name: cfg.get("label", name) for name, cfg in ITEMS.items()}
@@ -94,7 +94,7 @@ WEAK_ALIASES: set[str] = set()
 for _item, _cfg in ITEMS.items():
     for _w in _cfg.get("weak_aliases", []):
         if _w.lower() not in [a.lower() for a in _cfg["aliases"]]:
-            raise ValueError(f"weak_aliases '{_w}' bukan salah satu alias item {_item} (items.py)")
+            raise ValueError(f"weak_aliases '{_w}' bukan salah satu alias item {_item} (config.py)")
         WEAK_ALIASES.add(_w.lower())
 
 ALIAS_TO_ITEM: dict[str, str] = {}
@@ -102,7 +102,7 @@ for _item, _aliases in TRACKED_ITEMS.items():
     for _a in _aliases:
         _a = _a.lower()
         if ALIAS_TO_ITEM.get(_a, _item) != _item:
-            raise ValueError(f"Alias '{_a}' dipakai oleh dua item: {ALIAS_TO_ITEM[_a]} dan {_item} (items.py)")
+            raise ValueError(f"Alias '{_a}' dipakai oleh dua item: {ALIAS_TO_ITEM[_a]} dan {_item} (config.py)")
         ALIAS_TO_ITEM[_a] = _item
 ALIAS_RE = re.compile(
     r"(?<![a-z0-9])(?:"

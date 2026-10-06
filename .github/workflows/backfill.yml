@@ -19,25 +19,58 @@ on:
         description: 'Tahap kerangka: ambil 1 hari tiap N hari lebih dulu (0 = lewati)'
         required: true
         default: '45'
+      target:
+        description: 'Item yang di-scrape (pilihan dari scraper/config.py; jalankan scraper/sync_workflow.py setelah mengubah config)'
+        required: true
+        type: choice
+        default: '(semua item aktif)'
+        options:
+          # BEGIN-OPTIONS (dibuat otomatis oleh scraper/sync_workflow.py, jangan diedit manual)
+          - "(semua item aktif)"
+          - "growscan"
+          # END-OPTIONS
+      items:
+        description: 'Opsional: ketik beberapa item sekaligus (mis. growscan,ghc atau preset:harian). Mengalahkan dropdown.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
   actions: write   # agar tiap scraper bisa menjalankan dirinya sendiri untuk melanjutkan
 
-# Run dengan rentang yang sama tidak boleh tumpang tindih;
+# Run dengan pilihan yang sama tidak boleh tumpang tindih;
 # rentang berbeda (potongan paralel) boleh berjalan bersamaan.
 concurrency:
-  group: scraper-${{ inputs.start_date }}-${{ inputs.end_date }}-${{ inputs.chunks }}
+  group: scraper-${{ inputs.start_date }}-${{ inputs.end_date }}-${{ inputs.chunks }}-${{ inputs.target }}-${{ inputs.items }}
   cancel-in-progress: false
 
 jobs:
-  # 1) Bagi rentang tanggal menjadi N potongan berurutan dengan ukuran hampir sama.
+  # 1) Periksa pilihan item (gagal cepat bila salah ketik) dan bagi rentang tanggal menjadi N potongan.
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.split.outputs.matrix }}
+      select: ${{ steps.sel.outputs.select }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - id: sel
+        name: Validate item selection
+        env:
+          TARGET: ${{ inputs.target }}
+          ITEMS: ${{ inputs.items }}
+        run: |
+          if [ -n "$ITEMS" ]; then SELECT="$ITEMS"
+          elif [ "$TARGET" = "(semua item aktif)" ]; then SELECT=""
+          else SELECT="$TARGET"; fi
+          python scraper/show_config.py --check "$SELECT"
+          echo "select=$SELECT" >> "$GITHUB_OUTPUT"
+
       - id: split
+        name: Split date range
         env:
           START: ${{ inputs.start_date }}
           END: ${{ inputs.end_date }}
@@ -63,8 +96,7 @@ jobs:
           PY
 
   # 2) Kerangka: 1 hari tiap N hari, dikerjakan berurutan dari terbaru ke terlama.
-  #    Ini menyebar titik acuan harga agar tiap potongan paralel tahu skala harga di
-  #    zamannya (angka tanpa satuan seperti "2720" ditentukan dari acuan ini).
+  #    Ini menyebar titik acuan harga agar tiap potongan paralel tahu skala harga di zamannya.
   skeleton:
     needs: plan
     if: ${{ inputs.skeleton_every != '0' }}
@@ -92,7 +124,11 @@ jobs:
           START: ${{ inputs.start_date }}
           END: ${{ inputs.end_date }}
           EVERY: ${{ inputs.skeleton_every }}
-        run: python pipeline.py --backfill "$START" "$END" --every "$EVERY" --max-minutes 330
+          SELECT: ${{ needs.plan.outputs.select }}
+        run: |
+          ARGS=()
+          if [ -n "$SELECT" ]; then ARGS+=(--items "$SELECT"); fi
+          python pipeline.py --backfill "$START" "$END" --every "$EVERY" --max-minutes 330 "${ARGS[@]}"
 
   # 3) Scraper paralel: tiap potongan memproses harinya dari terbaru ke terlama.
   scrape:
@@ -125,9 +161,13 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           START: ${{ matrix.start }}
           END: ${{ matrix.end }}
-        run: python pipeline.py --backfill "$START" "$END" --max-minutes 330
+          SELECT: ${{ needs.plan.outputs.select }}
+        run: |
+          ARGS=()
+          if [ -n "$SELECT" ]; then ARGS+=(--items "$SELECT"); fi
+          python pipeline.py --backfill "$START" "$END" --max-minutes 330 "${ARGS[@]}"
 
-      # Kalau potongan ini belum selesai, jalankan lagi hanya potongan ini.
+      # Kalau potongan ini belum selesai, jalankan lagi hanya potongan ini (dengan pilihan item yang sama).
       # Hari yang sudah selesai otomatis dilewati lewat tabel scrape_log.
       - name: Continue this chunk in a new run
         if: steps.scrape.outputs.remaining != '0'
@@ -135,6 +175,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           START: ${{ matrix.start }}
           END: ${{ matrix.end }}
+          SELECT: ${{ needs.plan.outputs.select }}
         run: >
           gh workflow run "${{ github.workflow }}"
-          -f start_date="$START" -f end_date="$END" -f chunks=1 -f skeleton_every=0
+          -f start_date="$START" -f end_date="$END" -f chunks=1 -f skeleton_every=0 -f items="$SELECT"
