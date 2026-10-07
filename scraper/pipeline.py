@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time as _time
 from collections import Counter
 from datetime import date, datetime, time, timedelta
@@ -84,6 +85,11 @@ def to_snowflake(dt: datetime) -> int:
     return (int(dt.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
 
 
+def _scrub(text: str) -> str:
+    """Sembunyikan ID channel dari teks yang akan masuk log (log Actions publik bila repo public)."""
+    return re.sub(r"/channels/\d+", "/channels/***", str(text))
+
+
 class TransientError(Exception):
     """Gangguan sementara dari Discord (5xx / jaringan) yang tidak pulih setelah beberapa kali coba."""
 
@@ -114,19 +120,22 @@ class DiscordClient:
                 if r.status_code in (401, 403):
                     raise SystemExit(
                         f"Discord menolak akses ({r.status_code}). Cek token, atau akun "
-                        f"tidak punya izin baca channel {path}."
+                        f"tidak punya izin baca channel {_scrub(path)}."
                     )
                 if r.status_code < 500:
-                    r.raise_for_status()  # 4xx lain = masalah permanen, jangan diulang
+                    try:
+                        r.raise_for_status()  # 4xx lain = masalah permanen, jangan diulang
+                    except Exception as e:
+                        raise RuntimeError(_scrub(f"{type(e).__name__}: {e}")) from None
                     return r.json()
                 failures += 1
                 wait = min(120, 5 * 2 ** min(failures, 5))
                 print(f"[server] Discord membalas {r.status_code}, coba lagi dalam {wait} detik "
                       f"(gagal ke-{failures})", flush=True)
             if failures > MAX_TRANSIENT_FAILURES:
-                raise TransientError(f"Discord tidak stabil untuk {path} setelah {failures} percobaan")
+                raise TransientError(f"Discord tidak stabil untuk {_scrub(path)} setelah {failures} percobaan")
             _time.sleep(wait)
-        raise TransientError(f"Terlalu banyak retry untuk {path}")
+        raise TransientError(f"Terlalu banyak retry untuk {_scrub(path)}")
 
     def messages_between(self, channel_id: int, start: datetime, end: datetime) -> Iterator[dict]:
         """Ambil pesan [start, end) dengan paginasi mundur (terbaru -> terlama)."""
@@ -171,13 +180,21 @@ def fetch_day(dc: DiscordClient, plan: dict[int, set[str]], day: date) -> list[O
     start = datetime.combine(day, time.min, tzinfo=TZ)
     end = start + timedelta(days=1)
     offers: list[Offer] = []
+    skipped = 0
     for cid, wanted in plan.items():
         for m in dc.messages_between(cid, start, end):
             if m["author"].get("bot") or not m.get("content"):
                 continue
             # hanya item milik channel ini (sesuai kelompok channel item tersebut)
-            offers.extend(o for o in parse_message(m["content"], m["author"]["id"]) if o.item in wanted)
+            try:
+                offers.extend(o for o in parse_message(m["content"], m["author"]["id"]) if o.item in wanted)
+            except Exception as e:  # satu pesan aneh tidak boleh mematikan scrape berjam-jam
+                skipped += 1
+                if skipped == 1:
+                    print(f"[peringatan] pesan dilewati karena error parsing ({type(e).__name__}: {e}); {m['content'][:60]!r}", flush=True)
         _time.sleep(DELAY)
+    if skipped:
+        print(f"[peringatan] {day}: {skipped} pesan dilewati karena error parsing", flush=True)
     return offers  # data mentah hanya hidup di memori, per hari
 
 

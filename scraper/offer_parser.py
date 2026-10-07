@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from statistics import mean, median, quantiles
@@ -143,7 +144,15 @@ def mentions_tracked(text: str) -> bool:
     return bool(ALIAS_RE.search(text))
 
 
+def _canon(word: str) -> str:
+    """Bentuk ASCII huruf kecil dari sebuah kata ('BUYİNG' -> 'buying'), untuk pencarian kamus."""
+    return unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode().lower()
+
+
 def _normalize(text: str) -> str:
+    # NFKC: huruf bergaya (𝗦𝗘𝗟𝗟, ＳＥＬＬ, ᴮᴳᴸ) menjadi huruf biasa. İ/ı (alfabet Turki) tidak ikut
+    # berubah, jadi dipetakan manual; tanpa itu 'BUYİNG' lolos regex tetapi gagal di kamus.
+    text = unicodedata.normalize("NFKC", text).replace("\u0130", "I").replace("\u0131", "i")
     def emoji(m: re.Match) -> str:
         unit = EMOJI_ID_UNITS.get(m[2]) or EMOJI_NAME_UNITS.get(m[1].lower().replace("_", ""))
         return f" {unit} " if unit else " "
@@ -176,8 +185,11 @@ def parse_message(text: str, author: str) -> list[Offer]:
             if m["unit"] or not QTY_AFTER_RE.match(line, m.end())
         ]
         # Bila item ini hanya disebut lewat alias lemah ("gs"), angka tanpa satuan tidak dipercaya.
-        last_item = ALIAS_TO_ITEM[last[0].lower()]
-        mentions = [m[0].lower() for m in aliases if ALIAS_TO_ITEM[m[0].lower()] == last_item]
+        last_item = ALIAS_TO_ITEM.get(_canon(last[0]))
+        action = ACTIONS.get(_canon(act[1]))
+        if last_item is None or action is None:
+            continue  # karakter aneh yang lolos regex tetapi bukan alias/aksi sungguhan
+        mentions = [_canon(m[0]) for m in aliases if ALIAS_TO_ITEM.get(_canon(m[0])) == last_item]
         if all(a in WEAK_ALIASES for a in mentions):
             cands = [m for m in cands if m["unit"]]
         if not cands:
@@ -190,8 +202,8 @@ def parse_message(text: str, author: str) -> list[Offer]:
         weak = not price["unit"] and bool(QTY_BEFORE_RE.search(line[: price.start()]))
         offers.append(
             Offer(
-                item=ALIAS_TO_ITEM[last[0].lower()],
-                action=ACTIONS[act[1].lower()],
+                item=last_item,
+                action=action,
                 value=value,
                 unit=(price["unit"] or "").lower() or None,
                 author=author,
