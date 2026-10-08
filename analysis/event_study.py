@@ -229,6 +229,25 @@ def run(args) -> int:
     print("Kesimpulan      :", " ".join(verdict))
     print("Catatan: jendela dan batas ini sebaiknya ditetapkan SEBELUM melihat hasil; mencoba banyak jendela sampai ada yang bagus menggembungkan peluang kebetulan.")
 
+    # --- ketahanan: item di tahun yang sama bergerak bersama, jadi sampel efektif adalah JUMLAH TAHUN, bukan jumlah baris
+    by_year = {}
+    for u in units:
+        by_year.setdefault(u["start"].year, []).append(u["S"])
+    print(f"\nPer tahun (rata-rata item): " + " | ".join(f"{y}: {pct(np.mean(v)):+.1f}%" for y, v in sorted(by_year.items())))
+    print(f"Sampel efektif sebenarnya: {len(by_year)} tahun berbeda (bukan {n} kejadian), karena item di tahun yang sama saling terkait.")
+    if len(by_year) >= 3:
+        print("Uji ketahanan (membuang satu tahun):")
+        for y in sorted(by_year):
+            sub = [u for u in units if u["start"].year != y]
+            p_sub = _shift_p([(u["item"], u["i"]) for u in sub], S_arr, args)
+            ps = f"{p_sub:.3f}" if np.isfinite(p_sub) else "n/a"
+            print(f"   tanpa {y}: efek rata-rata {pct(np.mean([u['S'] for u in sub])):+.1f}% | p turun = {ps} ({len(sub)} kejadian)")
+        print("   -> Kalau efek hilang atau p melonjak begitu satu tahun dibuang, kesimpulannya bertumpu pada tahun itu saja.")
+    steep = [u for u in units if abs(u["slope"]) >= 0.5]
+    if steep:
+        print("\nPERINGATAN tren curam sebelum event (>= 0,5%/hari): " + ", ".join(f"{u['item']} {u['start']} ({u['slope']:+.2f}%/hari)" for u in steep))
+        print("   Mengekstrapolasi tren sebesar itu ke depan bisa membuat 'efek' tampak sangat besar hanya karena tren BERBALIK. Bandingkan dengan --detrend none.")
+
     # --- grafik profil
     import matplotlib
     matplotlib.use("Agg")
@@ -381,6 +400,8 @@ def parse():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="analysis_out")
     a = ap.parse_args()
+    if a.explore and (a.power or a.event):
+        ap.error("--explore tidak bisa digabung dengan --event / --power (--explore hanya membuat peta musiman). Jalankan terpisah.")
     if not a.explore and not a.event:
         ap.error("isi --event KATA_KUNCI (atau pakai --explore)")
     return a

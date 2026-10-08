@@ -18,6 +18,7 @@ Pemakaian:
     python pipeline.py --backfill 2023-01-01 2026-10-03 --force   # proses ulang walau sudah pernah
     python pipeline.py --backfill 2023-01-01 2026-10-03 --max-minutes 330   # berhenti rapi setelah 5,5 jam
     python pipeline.py --date 2026-10-02 --sample 15  # lihat pesan mentah, tanpa menyimpan
+    python pipeline.py --date 2024-05-16 --count      # hitung pesan yang terbaca (untuk dicocokkan dengan pencarian Discord)
 
 Backfill berjalan dari tanggal terbaru ke terlama: satuan harga untuk angka tanpa
 satuan ("growscan 2720") ditentukan dari harga tersimpan di hari-hari yang lebih baru,
@@ -56,8 +57,11 @@ from supabase import create_client
 from selection import channel_key, describe, item_channels, resolve_selection
 from settings import ITEMS
 from offer_parser import (
+    ALIAS_RE,
     ITEM_LABELS,
     SIDE_BAND,
+    _canon,
+    _normalize,
     anchor_value,
     Offer,
     mentions_tracked,
@@ -212,6 +216,31 @@ def show_sample(dc: DiscordClient, channel_ids: list[int], day: date, limit: int
         if shown >= limit:
             break
     print(f"{shown} pesan ditampilkan (mode sample, tidak ada yang disimpan)")
+
+
+def count_day(dc: DiscordClient, channels_of: dict[str, list[int]], items: list[str], day: date) -> None:
+    """Hitung pesan yang dibaca scraper pada satu hari, per channel, untuk dicocokkan dengan hasil pencarian
+    di Discord (mis. kata kunci + filter tanggal + filter channel). Tidak menyimpan apa pun."""
+    start = datetime.combine(day, time.min, tzinfo=TZ)
+    end = start + timedelta(days=1)
+    channels = sorted({c for i in items for c in channels_of[i]})
+    print(f"\n=== {day}: pesan yang dibaca scraper (zona waktu {TZ.key}) ===")
+    for n, cid in enumerate(channels, 1):
+        total, hits, per_alias, first, last = 0, 0, Counter(), None, None
+        for m in dc.messages_between(cid, start, end):
+            total += 1
+            ts = datetime.fromtimestamp(((int(m["id"]) >> 22) + DISCORD_EPOCH_MS) / 1000, tz=TZ)
+            first = ts if first is None or ts < first else first
+            last = ts if last is None or ts > last else last
+            found = {_canon(a[0]) for a in ALIAS_RE.finditer(_normalize(m.get("content") or ""))}
+            if found:
+                hits += 1
+                per_alias.update(found)
+        span = f"{first:%H:%M} sampai {last:%H:%M}" if first else "(tidak ada pesan)"
+        print(f"channel #{n}: {total} pesan semua, rentang jam {span}")
+        print(f"   yang menyebut item: {hits} pesan | per alias: " + (", ".join(f"{a}={c}" for a, c in per_alias.most_common()) or "-"))
+    print("Bandingkan 'per alias' dengan hasil pencarian Discord untuk kata itu pada tanggal dan channel yang sama.")
+    print("(Pencarian Discord memakai pencocokan kata yang longgar, jadi selisih kecil wajar.)")
 
 
 def daterange(start: date, end: date):
@@ -406,6 +435,7 @@ def main():
     ap.add_argument("--items", help="pilihan item dipisah koma: nama, preset:NAMA, atau all "
                                     "(default: semua item aktif di config.py)")
     ap.add_argument("--list", action="store_true", help="tampilkan isi config.py lalu keluar")
+    ap.add_argument("--count", action="store_true", help="hitung pesan yang terbaca pada --date (tanpa menyimpan)")
     ap.add_argument("--stamp-log", action="store_true",
                     help="beri sidik jari channel pada baris scrape_log lama, lalu keluar (sekali, setelah migrasi 004)")
     ap.add_argument("--oldest-first", action="store_true",
@@ -448,6 +478,9 @@ def main():
     if args.sample:
         day = args.date or (args.backfill[0] if args.backfill else yesterday)
         show_sample(dc, all_channels, day, args.sample)
+        return
+    if args.count:
+        count_day(dc, channels_of, items, args.date or yesterday)
         return
 
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
