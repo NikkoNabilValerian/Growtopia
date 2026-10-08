@@ -74,6 +74,22 @@ asteroid_nama = "Asteroid"
 asteroid_alias = "asteroid"
 asteroid_channel = CH_ASTEROID
 
+#--- HS
+hs_nama = "Heavenly Scythe"
+hs_alias = "heavenly scythe, hs"
+hs_channel = CH_GANG
+
+#--- Locket
+locket_nama = "Datemaster's Heart Locket"
+locket_alias = "datemaster's heart locket, locket, datemaster heart locket"
+locket_channel = CH_GANG
+
+#--- Golden Diaper
+golden_diaper_nama = "Golden Diaper"
+golden_diaper_alias = "golden diaper, gd, gdiaper, g diaper"
+golden_diaper_channel = CH_GANG
+
+
 # ---- Contoh item berikutnya (hapus tanda # di depan tiap baris, lalu sesuaikan)
 # ghc_nama      = "Golden Heart Crystal"
 # ghc_alias     = "ghc, golden heart crystal"
