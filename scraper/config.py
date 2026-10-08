@@ -21,6 +21,7 @@ CH_GROWSCAN = 900836866373333052, 782718904056807494, 900860787298553877      # 
 CH_GHC = 900836866373333052, 806455698014732318, 900847822570651658
 CH_GANG = 900836866373333052, 806455698014732318, 900847822570651658
 CH_MAGPLANT = 900836866373333052, 782718904056807494, 900860787298553877
+CH_ASTEROID = 806494773711339530, 782720570143277116
 # CH_TOOLS      = 111111111111111111      # contoh
 
 
@@ -67,6 +68,11 @@ magplant_nama      = "Magplant 5000"
 magplant_alias     = "magplant, mag, magplant 5000"
 magplant_nama_angka = "5000"
 magplant_channel   = CH_MAGPLANT
+
+#---Asteroid
+asteroid_nama = "Asteroid"
+asteroid_alias = "asteroid"
+asteroid_channel = CH_ASTEROID
 
 # ---- Contoh item berikutnya (hapus tanda # di depan tiap baris, lalu sesuaikan)
 # ghc_nama      = "Golden Heart Crystal"
