@@ -296,37 +296,57 @@ def _shift_p(unit_pos, S_arr, args) -> float:
 def power(series: dict, chosen: pd.DataFrame, args) -> int:
     """Seberapa besar penurunan yang BISA terdeteksi dari data ini? Menanam penurunan buatan (bentuk sama:
     turun hari +2..+12, pulih penuh hari +25) di deret ASLI pada kalender semu (kalender event digeser ke
-    tempat acak), lalu mengukur seberapa sering uji menangkapnya. Menjawab: 'kalau hasilnya tidak
+    tempat lain), lalu mengukur seberapa sering uji menangkapnya. Menjawab: 'kalau hasilnya tidak
     signifikan, apakah itu karena memang tidak ada efek, atau karena datanya terlalu berisik?'"""
+    MIN_PSEUDO_SHIFT = 60  # kalender semu minimal sejauh ini dari yang asli, supaya tidak menimpa event sungguhan
     rng = np.random.default_rng(args.seed)
-    base = [(it, (ev["start_date"] - lp.index[0]).days) for it, lp in series.items()
-            for _, ev in chosen.iterrows() if 0 <= (ev["start_date"] - lp.index[0]).days < len(lp)]
+    S0 = _s_arrays(series, args)
+    in_table, base, dropped = 0, [], []
+    for it, lp in series.items():
+        for _, ev in chosen.iterrows():
+            i = (ev["start_date"] - lp.index[0]).days
+            if not 0 <= i < len(lp):
+                continue
+            in_table += 1
+            if np.isfinite(S0[it][i]):
+                base.append((it, i))
+            else:
+                dropped.append(f"{it} {ev['name']}")
     if not base:
-        sys.exit("Tidak ada kejadian event di dalam rentang data.")
-    n_units = len(base)
-    levels = [0.05, 0.10, 0.15, 0.20, 0.30]
+        sys.exit("Tidak ada kejadian event dengan data cukup. Coba --min-volume 3 atau item lain.")
+    # kalender semu valid = semua kejadian terpakai punya data cukup pada tanggal yang digeser
+    valid_k = [k for k in range(-args.max_shift, args.max_shift + 1)
+               if abs(k) >= MIN_PSEUDO_SHIFT
+               and all(0 <= i + k < len(S0[it]) and np.isfinite(S0[it][i + k]) for it, i in base)]
     shape = np.zeros(args.post + 1)
     for t in range(2, min(26, args.post + 1)):
         shape[t] = 1.0 if t <= 12 else 1 - (t - 12) / 13
 
-    print(f"\n=== DAYA UJI: '{args.event}' | item: {', '.join(series)} | {n_units} kejadian | {args.power_reps} ulangan per ukuran ===")
-    print("Penurunan buatan ditanam di deret aslimu pada kalender semu; tabel = seberapa sering uji menangkapnya (p<0.05).\n")
+    print(f"\n=== DAYA UJI: '{args.event}' | item: {', '.join(series)} ===")
+    print(f"Kejadian terpakai: {len(base)} dari {in_table} di tabel" + (f" (dilewati karena data kurang: {', '.join(dropped)})" if dropped else ""))
+    print(f"Kalender semu yang valid (semua kejadian punya data di tanggal geseran): {len(valid_k)} dari {2 * args.max_shift + 1 - 2 * MIN_PSEUDO_SHIFT} kemungkinan")
+    if len(valid_k) < 5:
+        print("\nTIDAK BISA DIHITUNG: hampir tidak ada geseran kalender yang membuat SEMUA kejadian punya data cukup.")
+        print("Penyebab biasa: data awal terlalu jarang (banyak hari berpostingan < --min-volume), atau item yang digabung "
+              "mulai pada tahun berbeda.")
+        print("Coba: --min-volume 3 (lebih berisik tapi lebih banyak hari terpakai), uji satu item per kali, atau tunggu data bertambah.")
+        print("Catatan: ini juga berarti uji utama (--event tanpa --power) punya sedikit kalender pembanding, jadi p-valuenya kasar.")
+        return 1
+    ks = rng.choice(valid_k, size=min(args.power_reps, len(valid_k)), replace=False)
+    print(f"Penurunan buatan ditanam di deret aslimu pada {len(ks)} kalender semu; tabel = seberapa sering uji menangkapnya.\n")
     print("  penurunan  | terdeteksi p<0.05 | terdeteksi p<0.10")
-    mde = None
-    for dip in levels:
+    mde, computed = None, 0
+    for dip in [0.05, 0.10, 0.15, 0.20, 0.30]:
         d = -np.log(1 - dip)
         hit05 = hit10 = tried = 0
-        for _ in range(args.power_reps):
-            k = int(rng.integers(-args.max_shift, args.max_shift + 1))
-            pos = [(it, i + k) for it, i in base]
-            if any(not (args.trend[0] * -1 <= j < len(series[it]) - args.post - 1) for it, j in pos):
-                continue
+        for k in ks:
+            pos = [(it, i + int(k)) for it, i in base]
             mod = {}
             for it, lp in series.items():
                 x = lp.copy()
                 for it2, j in pos:
                     if it2 == it:
-                        x.iloc[j:j + args.post + 1] -= d * shape
+                        x.iloc[j:j + args.post + 1] -= d * shape[: len(x.iloc[j:j + args.post + 1])]
                 mod[it] = x
             S_arr = _s_arrays(mod, args)
             if not all(np.isfinite(S_arr[it][j]) for it, j in pos):
@@ -337,16 +357,19 @@ def power(series: dict, chosen: pd.DataFrame, args) -> int:
                 hit05 += p < 0.05
                 hit10 += p < 0.10
         if tried == 0:
-            print(f"  -{dip*100:>3.0f}%      | (tidak ada kalender semu yang valid; data terlalu pendek)")
+            print(f"  -{dip*100:>3.0f}%      | (tidak ada kalender semu yang bisa diuji)")
             continue
+        computed += 1
         r05, r10 = hit05 / tried, hit10 / tried
-        print(f"  -{dip*100:>3.0f}%      | {r05*100:>10.0f}%       | {r10*100:>10.0f}%    ({tried} ulangan valid)")
+        print(f"  -{dip*100:>3.0f}%      | {r05*100:>10.0f}%       | {r10*100:>10.0f}%    ({tried} ulangan{' - sedikit, perkiraan kasar' if tried < 10 else ''})")
         if mde is None and r05 >= 0.8:
             mde = dip
     print()
-    if mde is None:
+    if computed == 0:
+        print("Kesimpulan: tidak ada yang bisa dihitung (kalender pembanding terlalu sedikit). Jangan menafsirkan apa pun dari ini.")
+    elif mde is None:
         print("Kesimpulan: bahkan penurunan 30% belum terdeteksi andal (>=80%). Dengan jumlah kejadian dan tingkat derau ini, "
-              "hasil 'tidak signifikan' TIDAK berarti tidak ada efek. Tambahkan item atau tahun, atau perlebar jendela data.")
+              "hasil 'tidak signifikan' TIDAK berarti tidak ada efek. Tambahkan item atau tahun.")
     else:
         print(f"Kesimpulan: penurunan terkecil yang terdeteksi andal (>=80%) kira-kira {mde*100:.0f}%. "
               f"Efek lebih kecil dari itu tidak akan terlihat dari data ini, jadi 'tidak signifikan' berarti 'tidak ada efek sebesar itu atau lebih'.")
