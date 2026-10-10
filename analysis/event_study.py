@@ -264,7 +264,7 @@ def run(args) -> int:
     # --- ketahanan: item di tahun yang sama bergerak bersama, jadi sampel efektif adalah JUMLAH TAHUN, bukan jumlah baris
     by_year = {}
     for u in units:
-        by_year.setdefault(u["start"].year, []).append(u["S"])
+        by_year.setdefault(u["start"].year, []).append(u["raw"])
     print(f"\nPer tahun (rata-rata item): " + " | ".join(f"{y}: {pct(np.mean(v)):+.1f}%" for y, v in sorted(by_year.items())))
     print(f"Sampel efektif sebenarnya: {len(by_year)} tahun berbeda (bukan {n} kejadian), karena item di tahun yang sama saling terkait.")
     if len(by_year) >= 3:
@@ -273,7 +273,7 @@ def run(args) -> int:
             sub = [u for u in units if u["start"].year != y]
             p_sub = _shift_p([(u["item"], u["i"]) for u in sub], S_arr, args)
             ps = f"{p_sub:.3f}" if np.isfinite(p_sub) else "n/a"
-            print(f"   tanpa {y}: efek rata-rata {pct(np.mean([u['S'] for u in sub])):+.1f}% | p turun = {ps} ({len(sub)} kejadian)")
+            print(f"   tanpa {y}: efek rata-rata {pct(np.mean([u['raw'] for u in sub])):+.1f}% | p turun = {ps} ({len(sub)} kejadian)")
         print("   -> Kalau efek hilang atau p melonjak begitu satu tahun dibuang, kesimpulannya bertumpu pada tahun itu saja.")
     steep = [u for u in units if abs(u["slope"]) >= 0.5]
     if steep:
@@ -295,7 +295,20 @@ def run(args) -> int:
     ax.set_xlabel("hari sejak mulai event"); ax.set_ylabel("% terhadap tren sebelum event")
     ax.set_title(f"'{args.event}' - {', '.join(series)} (p turun = {p_drop:.3f})"); ax.legend(loc="best", fontsize=8)
     fig.tight_layout(); fig.savefig(out / "event_profile.png", dpi=130); plt.close(fig)
-    print(f"\nFile: {out/'event_profile.png'}, {out/'occurrences.csv'}")
+    # --- grafik per tahun: satu panel per tahun, satu garis per item (sampel efektif = jumlah tahun)
+    years = sorted(by_year)
+    fig, axes = plt.subplots(1, len(years), figsize=(5 * len(years), 4.2), sharey=True, squeeze=False)
+    for ax, y in zip(axes[0], years):
+        for u in units:
+            if u["start"].year == y:
+                ax.plot(t, pct(u["ar"]), lw=1.8, label=u["item"])
+        ax.axvline(0, color="k", lw=1, ls="--"); ax.axhline(0, color="k", lw=0.5)
+        ax.axvspan(args.stat[0], args.stat[1], color="#3b82f6", alpha=0.08)
+        ax.set_title(str(y)); ax.set_xlabel("hari sejak mulai event"); ax.legend(loc="best", fontsize=8)
+    axes[0][0].set_ylabel("% terhadap pembanding sebelum event")
+    fig.suptitle(f"'{args.event}' per tahun - {', '.join(series)}")
+    fig.tight_layout(); fig.savefig(out / "event_per_year.png", dpi=130); plt.close(fig)
+    print(f"\nFile: {out/'event_profile.png'}, {out/'event_per_year.png'}, {out/'occurrences.csv'}")
     return 0
 
 
