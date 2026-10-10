@@ -30,7 +30,8 @@ import argparse
 import os
 import re
 import sys
-from datetime import date
+import time
+from datetime import date, timedelta
 from statistics import median, quantiles
 
 DEFAULT_CHANNELS = "1083704905035952210"
@@ -213,6 +214,8 @@ def main() -> int:
     ap.add_argument("--sample", type=int, default=0, help="tampilkan N bacaan mentah (tanpa menyimpan)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--max-minutes", type=float, default=0,
+                    help="berhenti rapi setelah sekian menit (0 = tanpa batas); sisa dilaporkan ke GITHUB_OUTPUT")
     ap.add_argument("--min-idr", type=float, default=100, help="batas bawah wajar, rupiah per DL")
     ap.add_argument("--max-idr", type=float, default=1_000_000, help="batas atas wajar, rupiah per DL")
     args = ap.parse_args()
@@ -240,7 +243,13 @@ def main() -> int:
             days = [d for d in days if d.isoformat() not in have]
             print(f"{len(have)} hari sudah ada, dilewati. Memproses {len(days)} hari.", flush=True)
 
-    for day in sorted(days, reverse=True):
+    t0 = time.monotonic()
+    ordered = sorted(days, reverse=True)   # terbaru dulu
+    done: list[date] = []
+    for day in ordered:
+        if args.max_minutes and done and time.monotonic() - t0 > args.max_minutes * 60:
+            break
+        done.append(day)
         offers = []
         for m in pl.iter_messages(dc, channels, day):
             try:
@@ -260,6 +269,14 @@ def main() -> int:
               f"dari DL {row['idr_per_dl_from_dl']}, dari BGL/100 {row['idr_per_dl_from_bgl']}) | {row['posts']} post, {row['authors']} penulis", flush=True)
         if sb is not None:
             sb.table("daily_idr_rates").upsert(row, on_conflict="date").execute()
+
+    remaining = len(ordered) - len(done)
+    resume_end = (min(done) - timedelta(days=1)).isoformat() if remaining and done else ""
+    print(f"Selesai: {len(done)} hari diproses, sisa {remaining}" + (f" (lanjut sampai {resume_end})." if remaining else "."), flush=True)
+    out = os.getenv("GITHUB_OUTPUT")   # dibaca workflow untuk melanjutkan potongan yang belum selesai
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"remaining={remaining}\nresume_end={resume_end}\n")
     return 0
 
 

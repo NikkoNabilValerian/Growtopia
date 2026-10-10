@@ -1,0 +1,124 @@
+name: Run IDR Rate Scraper
+
+# Kurs DL/BGL (rupiah) -> tabel daily_idr_rates. Terpisah dari backfill.yml karena tidak memakai item/config.
+#  1) Manual: Actions -> "Run IDR Rate Scraper" -> Run workflow (rentang tanggal + jumlah potongan paralel).
+#  2) Otomatis tiap hari 08:30 WIB: mengambil data kemarin.
+# Aman diulang: hari yang sudah ada di tabel dilewati (kecuali force). Potongan yang kehabisan waktu
+# menjalankan dirinya sendiri lagi untuk sisanya (seperti backfill.yml).
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start Date (YYYY-MM-DD)'
+        required: true
+        default: '2023-10-01'
+      end_date:
+        description: 'End Date (YYYY-MM-DD); kosongkan = kemarin'
+        required: false
+        default: ''
+      chunks:
+        description: 'Jumlah scraper paralel (1-8)'
+        required: true
+        default: '4'
+      force:
+        description: 'Ulangi hari yang sudah ada'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '30 1 * * *'   # 01:30 UTC = 08:30 WIB
+
+permissions:
+  contents: read
+  actions: write   # agar tiap potongan bisa menjalankan dirinya sendiri untuk melanjutkan
+
+concurrency:
+  group: idr-rate-${{ inputs.start_date }}-${{ inputs.end_date }}-${{ inputs.chunks }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - id: split
+        name: Split date range
+        env:
+          EVENT: ${{ github.event_name }}
+          START: ${{ inputs.start_date }}
+          END: ${{ inputs.end_date }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+          yday = datetime.now(ZoneInfo("Asia/Jakarta")).date() - timedelta(days=1)
+          if os.environ["EVENT"] == "schedule":
+              start, end, n = yday, yday, 1
+          else:
+              start = date.fromisoformat(os.environ["START"])
+              end = date.fromisoformat(os.environ["END"]) if os.environ["END"] else yday
+              n = int(os.environ["CHUNKS"] or 4)
+          total = (end - start).days + 1
+          if total < 1:
+              raise SystemExit(f"Rentang kosong: {start} s/d {end}")
+          n = max(1, min(n, total, 8))
+          size, extra = divmod(total, n)
+          include, cur = [], start
+          for i in range(n):
+              last = cur + timedelta(days=size + (1 if i < extra else 0) - 1)
+              include.append({"id": i + 1, "start": cur.isoformat(), "end": last.isoformat()})
+              cur = last + timedelta(days=1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": include}) + "\n")
+          for c in include:
+              print(c)
+          PY
+
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ./scraper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Scrape chunk ${{ matrix.id }} (${{ matrix.start }} to ${{ matrix.end }})
+        id: scrape
+        env:
+          DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          START: ${{ matrix.start }}
+          END: ${{ matrix.end }}
+          FORCE: ${{ inputs.force && 'yes' || 'no' }}
+        run: |
+          ARGS=()
+          if [ "$FORCE" = "yes" ]; then ARGS+=(--force); fi
+          python idr_rate.py --backfill "$START" "$END" --max-minutes 330 "${ARGS[@]}"
+
+      # Kalau potongan ini belum selesai, jalankan lagi hanya sisanya (hari yang lebih lama).
+      - name: Continue this chunk in a new run
+        if: steps.scrape.outputs.remaining != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          START: ${{ matrix.start }}
+          RESUME_END: ${{ steps.scrape.outputs.resume_end }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+        run: >
+          gh workflow run "${{ github.workflow }}"
+          -f start_date="$START" -f end_date="$RESUME_END" -f chunks=1 -f force="$FORCE"
