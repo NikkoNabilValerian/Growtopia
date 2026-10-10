@@ -106,6 +106,8 @@ def _units(line: str) -> list[dict]:
                 kind = "min"
             else:
                 kind, qty = "qty", float(q[1].replace(",", "."))
+                if qty <= 0:   # '0 bgl' / '0bgl': bukan jumlah yang sah
+                    kind, qty = "min", None
         res.append({"start": u.start(), "end": u.end(), "unit": _unit(u[1]), "kind": kind, "qty": qty})
     return res
 
@@ -128,7 +130,7 @@ def _read_line(line: str) -> list[tuple[str, float]]:
 
     if qtys and not merged and len(qtys) == 1 and len(cands) == 1:   # 'sell 5bgl rate 33,5k' / 'wtb 5 bgl 1.3jt'
         u, price = qtys[0], cands[0][1]
-        if not PER_RE.search(line):
+        if not PER_RE.search(line) and u["qty"]:
             price /= u["qty"]
         return [(u["unit"], price / DL_PER_UNIT[u["unit"]])]
     if merged:
@@ -241,7 +243,10 @@ def main() -> int:
     for day in sorted(days, reverse=True):
         offers = []
         for m in pl.iter_messages(dc, channels, day):
-            offers.extend(parse_message(m["content"], m["author"]["id"]))
+            try:
+                offers.extend(parse_message(m["content"], m["author"]["id"]))
+            except Exception as e:   # satu pesan aneh tidak boleh mematikan backfill berjam-jam
+                print(f"[peringatan] {day}: pesan dilewati ({type(e).__name__}: {e}) | {m['content'][:80]!r}", flush=True)
         if args.sample:
             print(f"\n=== {day}: {len(offers)} bacaan, {args.sample} pertama ===")
             for o in offers[: args.sample]:
