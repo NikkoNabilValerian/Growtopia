@@ -56,6 +56,19 @@ def _fetch_all(table: str, **filters) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+IDR_PSEUDO_ITEM = "dl_idr"   # --items dl_idr = kurs rupiah per 1 DL itu sendiri (dari tabel daily_idr_rates)
+
+
+def load_idr_rate() -> pd.Series:
+    """Kurs harian rupiah per 1 DL; celah <= 3 hari diinterpolasi (sama seperti harga item)."""
+    rate = _fetch_all("daily_idr_rates")
+    if rate.empty:
+        sys.exit("Tabel daily_idr_rates kosong. Jalankan scraper kurs dulu (scraper/idr_rate.py).")
+    rate["date"] = pd.to_datetime(rate["date"])
+    r = rate.drop_duplicates("date").set_index("date")["idr_per_dl"].astype(float).sort_index()
+    return r.reindex(pd.date_range(r.index.min(), r.index.max(), freq="D")).interpolate(limit=3, limit_area="inside")
+
+
 def load_prices(args) -> pd.DataFrame:
     df = pd.read_csv(args.csv, parse_dates=["date"]) if args.csv else _fetch_all("daily_item_prices")
     if df.empty:
@@ -63,7 +76,19 @@ def load_prices(args) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     if "total_volume" not in df:
         df["total_volume"] = 10**9
-    return df[df["item_name"].isin(args.items)]
+    df = df[df["item_name"].isin(args.items)]
+    rate = load_idr_rate() if (args.idr or IDR_PSEUDO_ITEM in args.items) else None
+    if args.idr:   # harga item (dalam BGL) x kurs: 1 BGL = 100 DL; hari tanpa kurs dibuang
+        df = df.assign(rate=df["date"].map(rate)).dropna(subset=["rate"])
+        df["median_price"] = df["median_price"].astype(float) * df["rate"] * 100
+        df = df.drop(columns="rate")
+    if IDR_PSEUDO_ITEM in args.items:
+        pseudo = rate.dropna().rename_axis("date").reset_index(name="median_price")
+        pseudo["item_name"], pseudo["total_volume"] = IDR_PSEUDO_ITEM, 10**9
+        df = pd.concat([df, pseudo], ignore_index=True)
+    if df.empty:
+        sys.exit("Tidak ada harga yang beririsan dengan kurs rupiah (cek rentang tanggal daily_idr_rates).")
+    return df
 
 
 def load_events(args) -> pd.DataFrame:
@@ -236,7 +261,7 @@ def run(args) -> int:
     table = pd.DataFrame(rows)
     table.to_csv(out / "occurrences.csv", index=False)
 
-    print(f"\n=== EVENT STUDY: '{args.event}' | item: {', '.join(series)} | {n} kejadian | statistik "
+    print(f"\n=== EVENT STUDY: '{args.event}' | item: {', '.join(series)}{' (HARGA DALAM RUPIAH)' if args.idr else ''} | {n} kejadian | statistik "
           f"{'terstandarisasi volatilitas lokal' if args.standardize else 'mentah (--no-standardize)'} ===")
     print(f"Jendela efek: hari +{args.stat[0]} s/d +{args.stat[1]} dari mulai event. "
           f"Pembanding: {'tren hari -%d..-%d diekstrapolasi' % (-args.trend[0], -args.trend[1]) if args.detrend == 'slope' else 'rata-rata hari %d..%d' % tuple(args.base)}.")
@@ -367,7 +392,7 @@ def power(series: dict, chosen: pd.DataFrame, args) -> int:
     for t in range(2, min(26, args.post + 1)):
         shape[t] = 1.0 if t <= 12 else 1 - (t - 12) / 13
 
-    print(f"\n=== DAYA UJI: '{args.event}' | item: {', '.join(series)} ===")
+    print(f"\n=== DAYA UJI: '{args.event}' | item: {', '.join(series)}{' (HARGA DALAM RUPIAH)' if args.idr else ''} ===")
     print(f"Kejadian terpakai: {len(base)} dari {in_table} di tabel" + (f" (dilewati karena data kurang: {', '.join(dropped)})" if dropped else ""))
     print(f"Kalender semu yang valid (semua kejadian punya data di tanggal geseran): {len(valid_k)} dari {2 * args.max_shift + 1 - 2 * MIN_PSEUDO_SHIFT} kemungkinan")
     if len(valid_k) < 5:
@@ -456,6 +481,8 @@ def parse():
                     help="geser tanggal mulai semua event (mis. -7); analisis kepekaan untuk memeriksa apakah tanggal mulai di tabel tepat")
     ap.add_argument("--power", action="store_true", help="ukur seberapa kecil penurunan yang bisa dideteksi dari data ini")
     ap.add_argument("--power-reps", type=int, default=20, help="ulangan per ukuran penurunan untuk --power")
+    ap.add_argument("--idr", action="store_true",
+                    help="ubah harga item (BGL) ke rupiah memakai kurs harian daily_idr_rates (1 BGL = 100 DL)")
     ap.add_argument("--csv", help="CSV harga (item_name,date,median_price,total_volume) sebagai pengganti Supabase")
     ap.add_argument("--events-csv", help="CSV event (name,start_date,end_date)")
     ap.add_argument("--pre", type=int, default=30)
