@@ -117,6 +117,26 @@ def stat_of(ar: np.ndarray | None, a) -> float:
     return float(np.nanmean(seg)) if np.isfinite(seg).sum() >= 0.6 * len(seg) else np.nan
 
 
+def local_sigma(x: np.ndarray, i: int, a) -> float:
+    """Simpangan baku return harian log selama jendela tren sebelum event (ukuran derau lokal)."""
+    w = np.arange(a.trend[0], a.trend[1] + 1)
+    if i + w[0] < 0:
+        return np.nan
+    d = np.diff(x[i + w])
+    d = d[np.isfinite(d)]
+    return float(np.std(d, ddof=1)) if len(d) >= 30 else np.nan
+
+
+def stat_value(x: np.ndarray, i: int, ar: np.ndarray | None, a) -> float:
+    """Statistik uji. Dengan --standardize dibagi volatilitas lokal, sehingga kejadian di masa tenang dan masa
+    bergejolak sebanding (kalau tidak, masa paling bergejolak menentukan seluruh sebaran plasebo)."""
+    s = stat_of(ar, a)
+    if not a.standardize or not np.isfinite(s):
+        return s
+    sg = local_sigma(x, i, a)
+    return s / sg if np.isfinite(sg) and sg > 0 else np.nan
+
+
 def pre_slope_pct(x: np.ndarray, i: int, a) -> float:
     w = np.arange(a.trend[0], a.trend[1] + 1)
     if i + w[0] < 0:
@@ -144,6 +164,12 @@ def run(args) -> int:
     chosen = events[events["name"].str.contains(args.event, case=False, na=False)].sort_values("start_date")
     if chosen.empty:
         sys.exit(f"Tidak ada event yang namanya memuat '{args.event}'. Event yang ada: {sorted(events['name'].unique())}")
+    if args.start_offset:
+        chosen = chosen.copy()
+        chosen["start_date"] = chosen["start_date"] + pd.Timedelta(days=args.start_offset)
+        chosen["end_date"] = chosen["end_date"] + pd.Timedelta(days=args.start_offset)
+        print(f"\nPERHATIAN: tanggal mulai semua event digeser {args.start_offset:+d} hari (analisis kepekaan). "
+              f"Mencoba beberapa geseran lalu memilih yang terbaik = eksplorasi; p-value tidak berlaku lagi sebagai bukti.")
     rng = np.random.default_rng(args.seed)
     if args.power:
         return power(series, chosen, args)
@@ -154,7 +180,7 @@ def run(args) -> int:
         x, dates = lp.to_numpy(), lp.index
         dates_of[it] = dates
         ars = [ar_profile(x, i, args) for i in range(len(dates))]
-        S_arr[it] = np.array([stat_of(ar, args) for ar in ars])
+        S_arr[it] = np.array([stat_value(x, i, ar, args) for i, ar in enumerate(ars)])
         AR_arr[it] = np.array([ar if ar is not None else np.full(args.pre + args.post + 1, np.nan) for ar in ars])
 
     units = []
@@ -164,11 +190,13 @@ def run(args) -> int:
             i = (ev["start_date"] - dates[0]).days
             if 0 <= i < len(dates) and np.isfinite(S_arr[it][i]):
                 units.append({"item": it, "event": ev["name"], "start": ev["start_date"].date(), "i": i,
-                              "S": float(S_arr[it][i]), "ar": AR_arr[it][i], "slope": pre_slope_pct(x, i, args)})
+                              "S": float(S_arr[it][i]), "raw": stat_of(AR_arr[it][i], args), "ar": AR_arr[it][i],
+                              "slope": pre_slope_pct(x, i, args)})
     if not units:
         sys.exit("Tidak ada kejadian event yang punya data cukup (cek rentang tanggal data dan --min-volume).")
     n = len(units)
-    S = np.array([u["S"] for u in units])
+    S = np.array([u["S"] for u in units])          # statistik uji (terstandarisasi bila --standardize)
+    RAW = np.array([u["raw"] for u in units])      # efek mentah (log), untuk ditampilkan dalam %
     t = np.arange(-args.pre, args.post + 1)
 
     # --- uji plasebo: geser SELURUH kalender event dengan selisih k hari yang sama untuk semua item.
@@ -193,7 +221,7 @@ def run(args) -> int:
     T = S.mean()
     p_drop = (1 + (Tk <= T).sum()) / (K + 1)
     p_two = (1 + (np.abs(Tk - Tk.mean()) >= abs(T - Tk.mean())).sum()) / (K + 1)
-    boot = rng.choice(S, size=(args.boot, n)).mean(axis=1)
+    boot = rng.choice(RAW, size=(args.boot, n)).mean(axis=1)
     lo, hi = np.percentile(boot, [5, 95])
     R, Tp = K, Tk
 
@@ -203,19 +231,23 @@ def run(args) -> int:
         seg = u["ar"][t >= 0]
         j = int(np.nanargmin(seg))
         rows.append({"item": u["item"], "event": u["event"], "mulai": u["start"], "tren_sebelum_%/hari": round(u["slope"], 2),
-                     f"efek_{args.stat[0]}..{args.stat[1]}_%": round(pct(u["S"]), 1),
+                     f"efek_{args.stat[0]}..{args.stat[1]}_%": round(pct(u["raw"]), 1),
                      "titik_terendah_%": round(pct(seg[j]), 1), "hari_terendah": j})
     table = pd.DataFrame(rows)
     table.to_csv(out / "occurrences.csv", index=False)
 
-    print(f"\n=== EVENT STUDY: '{args.event}' | item: {', '.join(series)} | {n} kejadian ===")
+    print(f"\n=== EVENT STUDY: '{args.event}' | item: {', '.join(series)} | {n} kejadian | statistik "
+          f"{'terstandarisasi volatilitas lokal' if args.standardize else 'mentah (--no-standardize)'} ===")
     print(f"Jendela efek: hari +{args.stat[0]} s/d +{args.stat[1]} dari mulai event. "
           f"Pembanding: {'tren hari -%d..-%d diekstrapolasi' % (-args.trend[0], -args.trend[1]) if args.detrend == 'slope' else 'rata-rata hari %d..%d' % tuple(args.base)}.")
     print(table.to_string(index=False))
-    neg = int((S < 0).sum())
-    print(f"\nEfek rata-rata  : {pct(T):+.1f}%   (median {pct(np.median(S)):+.1f}%)   interval 90% bootstrap {pct(lo):+.1f}% s/d {pct(hi):+.1f}%")
+    neg = int((RAW < 0).sum())
+    print(f"\nEfek rata-rata  : {pct(RAW.mean()):+.1f}%   (median {pct(np.median(RAW)):+.1f}%)   interval 90% bootstrap {pct(lo):+.1f}% s/d {pct(hi):+.1f}%")
     print(f"Konsistensi tanda: {neg} dari {n} kejadian negatif")
-    print(f"Plasebo ({R} kalender event digeser -{args.max_shift}..+{args.max_shift} hari): efek rata-rata biasa {pct(Tp.mean()):+.1f}% (sebaran 5-95%: {pct(np.percentile(Tp, 5)):+.1f}% s/d {pct(np.percentile(Tp, 95)):+.1f}%)")
+    if args.standardize:
+        print(f"Plasebo ({R} kalender digeser): statistik uji (satuan volatilitas harian) kejadian asli {T:+.2f}; plasebo rata-rata {Tp.mean():+.2f}, sebaran 5-95%: {np.percentile(Tp, 5):+.2f} s/d {np.percentile(Tp, 95):+.2f}")
+    else:
+        print(f"Plasebo ({R} kalender event digeser -{args.max_shift}..+{args.max_shift} hari): efek rata-rata biasa {pct(Tp.mean()):+.1f}% (sebaran 5-95%: {pct(np.percentile(Tp, 5)):+.1f}% s/d {pct(np.percentile(Tp, 95)):+.1f}%)")
     print(f"p-value (hanya turun): {p_drop:.3f}   |   dua arah: {p_two:.3f}")
     verdict = []
     if n < 4:
@@ -272,7 +304,7 @@ def _s_arrays(series: dict, args) -> dict:
     out = {}
     for it, lp in series.items():
         x = lp.to_numpy()
-        out[it] = np.array([stat_of(ar_profile(x, i, args), args) for i in range(len(x))])
+        out[it] = np.array([stat_value(x, i, ar_profile(x, i, args), args) for i in range(len(x))])
     return out
 
 
@@ -405,6 +437,10 @@ def parse():
     ap.add_argument("--items", required=True, type=lambda s: [x.strip() for x in s.split(",") if x.strip()])
     ap.add_argument("--event", default="", help="kata kunci nama event (tidak peka huruf besar/kecil)")
     ap.add_argument("--explore", action="store_true", help="peta musiman tanpa kalender event")
+    ap.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True,
+                    help="bagi efek dengan volatilitas harian lokal sebelum event (BAWAAN: aktif; matikan dengan --no-standardize)")
+    ap.add_argument("--start-offset", type=int, default=0, metavar="HARI",
+                    help="geser tanggal mulai semua event (mis. -7); analisis kepekaan untuk memeriksa apakah tanggal mulai di tabel tepat")
     ap.add_argument("--power", action="store_true", help="ukur seberapa kecil penurunan yang bisa dideteksi dari data ini")
     ap.add_argument("--power-reps", type=int, default=20, help="ulangan per ukuran penurunan untuk --power")
     ap.add_argument("--csv", help="CSV harga (item_name,date,median_price,total_volume) sebagai pengganti Supabase")
