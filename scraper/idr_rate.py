@@ -9,7 +9,8 @@ Channel bawaan: 1083704905035952210 (ubah dengan --channels atau env IDR_CHANNEL
 Yang dibaca: pesan para pengepul, mis. "BUY DL 850 | BGL 85.000 / SELL DL 880 | BGL 88.000".
 BUY/SELL adalah harga dari sisi pengepul (bid/ask). Nilai harian `idr_per_dl` = titik tengah median BUY dan
 median SELL, supaya tidak ikut naik-turun hanya karena jumlah postingan BUY vs SELL berbeda.
-Semua harga dinormalkan ke "rupiah per 1 DL" (1 BGL = 100 DL). Hari tanpa >= 3 postingan di kedua sisi dilewati.
+Satu penulis = satu suara per sisi (median postingannya), jadi iklan yang ditempel berulang tidak mendominasi.
+Semua harga dinormalkan ke "rupiah per 1 DL" (1 BGL = 100 DL). Hari tanpa >= 3 penulis di kedua sisi dilewati.
 
 SQL (jalankan sekali di Supabase):
     create table if not exists daily_idr_rates (
@@ -35,7 +36,7 @@ from statistics import median, quantiles
 DEFAULT_CHANNELS = "1083704905035952210"
 EMOJI_ID_UNITS = {"1083907791523164302": "bgl", "1083731540732805131": "dl"}   # :bgl: dan :DL: di server ini
 DL_PER_UNIT = {"dl": 1, "bgl": 100}
-MIN_SIDE_POSTS = 3      # satu sisi (buy/sell) butuh minimal ini agar hari itu disimpan
+MIN_SIDE_POSTS = 3      # minimal penulis berbeda per sisi (buy/sell) agar hari itu disimpan
 BAND = 2.0              # postingan di luar [median/2, median*2] dibuang
 PAIR_RATIO = (80, 125)  # tanpa satuan: dua angka dengan rasio ~100 = (DL, BGL)
 
@@ -164,23 +165,31 @@ def iqr_filter(xs: list[float], k: float = 1.5) -> list[float]:
 
 
 def summarize(offers: list[dict], day: str, lo: float, hi: float) -> tuple[dict | None, str]:
+    """Satu penulis = satu suara per sisi (median postingannya), supaya pengepul yang menempel iklan yang
+    sama puluhan kali tidak mendominasi median hari itu."""
     offers = [o for o in offers if lo <= o["idr_per_dl"] <= hi]
     if not offers:
         return None, "tidak ada bacaan dalam batas wajar"
     center = median(o["idr_per_dl"] for o in offers)
     offers = [o for o in offers if center / BAND <= o["idr_per_dl"] <= center * BAND]
-    buy = iqr_filter([o["idr_per_dl"] for o in offers if o["action"] == "buy"])
-    sell = iqr_filter([o["idr_per_dl"] for o in offers if o["action"] == "sell"])
+
+    def votes(action: str, unit: str | None = None) -> list[float]:
+        per_author: dict[str, list[float]] = {}
+        for o in offers:
+            if o["action"] == action and (unit is None or o["unit"] == unit):
+                per_author.setdefault(o["author"], []).append(o["idr_per_dl"])
+        return iqr_filter([median(v) for v in per_author.values()])
+
+    buy, sell = votes("buy"), votes("sell")
     if len(buy) < MIN_SIDE_POSTS or len(sell) < MIN_SIDE_POSTS:
-        return None, f"postingan buy={len(buy)}, sell={len(sell)} (butuh >= {MIN_SIDE_POSTS} per sisi)"
+        return None, f"penulis buy={len(buy)}, sell={len(sell)} (butuh >= {MIN_SIDE_POSTS} penulis per sisi)"
     buy_m, sell_m = median(buy), median(sell)
     if buy_m > sell_m * 1.02:
         return None, f"buy ({buy_m:.0f}) > sell ({sell_m:.0f}): tidak masuk akal, kemungkinan salah baca"
 
-    def by_unit(u):   # titik tengah buy/sell hanya dari postingan satuan ini (untuk memeriksa BGL = 100 DL)
-        b = [o["idr_per_dl"] for o in offers if o["unit"] == u and o["action"] == "buy"]
-        s = [o["idr_per_dl"] for o in offers if o["unit"] == u and o["action"] == "sell"]
-        return round((median(b) + median(s)) / 2, 2) if len(b) >= MIN_SIDE_POSTS and len(s) >= MIN_SIDE_POSTS else None
+    def by_unit(u):   # titik tengah hanya dari postingan satuan ini (untuk memeriksa BGL = 100 DL)
+        b, s_ = votes("buy", u), votes("sell", u)
+        return round((median(b) + median(s_)) / 2, 2) if len(b) >= MIN_SIDE_POSTS and len(s_) >= MIN_SIDE_POSTS else None
 
     return {
         "date": day,
@@ -189,7 +198,7 @@ def summarize(offers: list[dict], day: str, lo: float, hi: float) -> tuple[dict 
         "sell_idr_per_dl": round(sell_m, 2),
         "idr_per_dl_from_dl": by_unit("dl"),
         "idr_per_dl_from_bgl": by_unit("bgl"),
-        "posts": len(buy) + len(sell),
+        "posts": len(offers),
         "authors": len({o["author"] for o in offers}),
     }, ""
 
