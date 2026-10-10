@@ -72,6 +72,11 @@ ANCHOR_TOL_PER_DAY = 0.05  # N naik segini per hari umur patokan, sampai ANCHOR_
 BARE_DL_MIN: dict[str, float] = {n: c["bare_dl_min"] for n, c in ITEMS.items() if "bare_dl_min" in c}
 DEFAULT_BARE_DL_MIN = 50
 
+# Harga di atas ini (dalam WL; 10^9 WL = 100.000 BGL) pasti salah ketik/angka lain (jumlah, ID, dll.).
+# Tanpa batas ini, satu angka raksasa lolos saat item belum punya patokan harga dan membuat kolom
+# numeric di database overflow (numeric(14,4) -> maks < 10^10).
+MAX_PRICE_WL = 10**9
+
 MIN_POSTS_TO_STORE = 3   # hari dengan < 3 postingan valid tidak disimpan (median gabungan)
 # Median per SISI (buy / sell) lebih rapuh karena sampelnya lebih kecil, jadi aturannya lebih ketat:
 MIN_SIDE_POSTS = 5       # satu sisi butuh minimal 5 postingan agar medianya disimpan
@@ -265,6 +270,10 @@ def resolve_offers(offers: list[Offer], anchors: dict | None = None) -> list[Res
                     continue
                 unit = "dl" if o.value >= BARE_DL_MIN.get(item, DEFAULT_BARE_DL_MIN) else "bgl"
                 wl, how = o.value * WL_PER_UNIT[unit], "bare-statis"
+
+            if wl > MAX_PRICE_WL:   # angka mustahil: buang, apa pun patokannya
+                out.append(Resolved(o, None, "dibuang"))
+                continue
 
             tol = WEAK_TOLERANCE if (o.weak and not o.unit) else tol_anchor
             if anchor and _log_dist(wl, anchor) > math.log10(tol):

@@ -180,6 +180,21 @@ def build_plan(items: list[str], channels_of: dict[str, list[int]]) -> dict[int,
     return plan
 
 
+DB_NUM_LIMIT = 10**9   # kolom numeric(14,4) menolak >= 10^10; kita buang jauh sebelum itu
+
+
+def safe_rows(rows: list[dict], day) -> list[dict]:
+    """Buang baris dengan angka mustahil supaya satu hari buruk tidak mematikan seluruh run."""
+    ok = []
+    for r in rows:
+        bad = [k for k, v in r.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) >= DB_NUM_LIMIT]
+        if bad:
+            print(f"[peringatan] {day}: baris {r['item_name']} dibuang, nilai tidak masuk akal di {bad}", flush=True)
+        else:
+            ok.append(r)
+    return ok
+
+
 def fetch_day(dc: DiscordClient, plan: dict[int, set[str]], day: date) -> list[Offer]:
     start = datetime.combine(day, time.min, tzinfo=TZ)
     end = start + timedelta(days=1)
@@ -563,7 +578,7 @@ def main():
             failed += 1
             print(f"{day}: GAGAL sementara ({e}). Dilewati, akan dicoba lagi di run berikutnya.", flush=True)
             continue
-        rows = summarize_day(offers, day.isoformat(), anchors)
+        rows = safe_rows(summarize_day(offers, day.isoformat(), anchors), day)
         if rows:
             sb.table(TABLE).upsert(rows, on_conflict="item_name,date").execute()
         # Hapus baris lama item yang kini tidak punya data valid hari itu (mis. hasil

@@ -88,6 +88,7 @@ locket_channel = CH_GANG
 golden_diaper_nama = "Golden Diaper"
 golden_diaper_alias = "golden diaper, gd, gdiaper, g diaper"
 golden_diaper_channel = CH_GANG
+golden_diaper_harga = 20
 
 
 # ---- Contoh item berikutnya (hapus tanda # di depan tiap baris, lalu sesuaikan)
