@@ -112,7 +112,7 @@ golden_heart_glasses_channel = CH_GANG
 
 #--- Golden Heart Shirt
 golden_heart_shirt_nama = "Golden Heart Shirt"
-golden_heart_shirt_alias = "golden heart shirt, ghs"
+golden_heart_shirt_alias = "golden heart shirt, ghsirt, gshirt"
 golden_heart_shirt_channel = CH_GANG
 
 #--- Golden Heartbow
@@ -127,7 +127,7 @@ golden_heartbreak_wings_channel = CH_GANG
 
 #--- Golden Heartstaff
 golden_heartstaff_nama = "Golden Heartstaff"
-golden_heartstaff_alias = "golden heartstaff, ghs, ghstaff, gstaff"
+golden_heartstaff_alias = "golden heartstaff, ghstaff, gstaff"
 golden_heartstaff_channel = CH_GANG
 
 #--- Golden Heartthrob Helm
