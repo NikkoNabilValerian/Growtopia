@@ -90,6 +90,103 @@ golden_diaper_alias = "golden diaper, gd, gdiaper, g diaper"
 golden_diaper_channel = CH_GANG
 golden_diaper_harga = 20
 
+#--- Golden Air Robinsons
+golden_air_robinsons_nama = "Golden Air Robinsons"
+golden_air_robinsons_alias = "golden air robinsons, gair"
+golden_air_robinsons_channel = CH_GANG
+
+#--- Golden Diamond Necklace
+golden_diamond_necklace_nama = "Golden Diamond Necklace"
+golden_diamond_necklace_alias = "golden diamond necklace, gneck"
+golden_diamond_necklace_channel = CH_GANG
+
+#--- Golden Heart Aura
+golden_heart_aura_nama = "Golden Heart Aura"
+golden_heart_aura_alias = "golden heart aura, gha"
+golden_heart_aura_channel = CH_GANG
+
+#--- Golden Heart Glasses
+golden_heart_glasses_nama = "Golden Heart Glasses"
+golden_heart_glasses_alias = "golden heart glasses, ghg"
+golden_heart_glasses_channel = CH_GANG
+
+#--- Golden Heart Shirt
+golden_heart_shirt_nama = "Golden Heart Shirt"
+golden_heart_shirt_alias = "golden heart shirt, ghs"
+golden_heart_shirt_channel = CH_GANG
+
+#--- Golden Heartbow
+golden_heartbow_nama = "Golden Heartbow"
+golden_heartbow_alias = "golden heartbow, ghb, gbow"
+golden_heartbow_channel = CH_GANG
+
+#--- Golden Heartbreak Wings
+golden_heartbreak_wings_nama = "Golden Heartbreak Wings"
+golden_heartbreak_wings_alias = "golden heartbreak wings, ghw, golde heart break wings, golden heart wings"
+golden_heartbreak_wings_channel = CH_GANG
+
+#--- Golden Heartstaff
+golden_heartstaff_nama = "Golden Heartstaff"
+golden_heartstaff_alias = "golden heartstaff, ghs, ghstaff, gstaff"
+golden_heartstaff_channel = CH_GANG
+
+#--- Golden Heartthrob Helm
+golden_heartthrob_helm_nama = "Golden Heartthrob Helm"
+golden_heartthrob_helm_alias = "golden heartthrob helm, ghth, ghth, ghelm"
+golden_heartthrob_helm_channel = CH_GANG
+
+#--- Golden Love Bug
+golden_love_bug_nama = "Golden Love Bug"
+golden_love_bug_alias = "golden love bug, glb, gbug"
+golden_love_bug_channel = CH_GANG
+
+#--- Golden Mobile Suit Wings
+golden_mobile_suit_wings_nama = "Golden Mobile Suit Wings"
+golden_mobile_suit_wings_alias = "golden mobile suit wings, gmsw, gms wings"
+golden_mobile_suit_wings_channel = CH_GANG
+
+#--- Golden Sparkling Wings
+golden_sparkling_wings_nama = "Golden Sparkling Wings"
+golden_sparkling_wings_alias = "golden sparkling wings, gsw, gsparkling wings"
+golden_sparkling_wings_channel = CH_GANG
+
+#--- Golden Silk Scarf
+golden_silk_scarf_nama = "Golden Silk Scarf"
+golden_silk_scarf_alias = "golden silk scarf, gss, gsilk scarf"
+golden_silk_scarf_channel = CH_GANG
+
+#--- Golden Sunset Cape
+golden_sunset_cape_nama = "Golden Sunset Cape"
+golden_sunset_cape_alias = "golden sunset cape, gsc, gsunset cape, gscape"
+golden_sunset_cape_channel = CH_GANG
+
+#--- Golden Talaria
+golden_talaria_nama = "Golden Talaria"
+golden_talaria_alias = "golden talaria, gt, gtalaria"
+golden_talaria_channel = CH_GANG
+
+#--- Stained Glass Heartwings
+stained_glass_heartwings_nama = "Stained Glass Heartwings"
+stained_glass_heartwings_alias = "stained glass heartwings, sgh, sghw"
+stained_glass_heartwings_channel = CH_GANG
+
+#--- Teeny Golden Wings
+teeny_golden_wings_nama = "Teeny Golden Wings"
+teeny_golden_wings_alias = "teeny golden wings, tgw, tgwings"
+teeny_golden_wings_channel = CH_GANG
+
+#--- Rayman Fist
+rayman_fist_nama = "Rayman Fist"
+rayman_fist_alias = "rayman fist, rf, raymanfist, rayman"
+rayman_fist_channel = CH_MAGPLANT
+
+#--- Royal Lock
+royal_lock_nama = "Royal Lock"
+royal_lock_alias = "royal lock, rl, royallock"
+royal_lock_channel = CH_MAGPLANT
+
+
+
 
 # ---- Contoh item berikutnya (hapus tanda # di depan tiap baris, lalu sesuaikan)
 # ghc_nama      = "Golden Heart Crystal"
