@@ -260,6 +260,10 @@ def run(args) -> int:
                      "titik_terendah_%": round(pct(seg[j]), 1), "hari_terendah": j})
     table = pd.DataFrame(rows)
     table.to_csv(out / "occurrences.csv", index=False)
+    # jalur harian per kejadian (selisih % terhadap pembanding), untuk membuat gambar laporan
+    pd.DataFrame([{"item": u["item"], "tahun": u["start"].year, "hari": int(tt), "persen": round(float(v), 2)}
+                  for u in units for tt, v in zip(t, pct(u["ar"])) if np.isfinite(v)]
+                 ).to_csv(out / "profil_harian.csv", index=False)
 
     print(f"\n=== EVENT STUDY: '{args.event}' | item: {', '.join(series)}{' (HARGA DALAM RUPIAH)' if args.idr else ''} | {n} kejadian | statistik "
           f"{'terstandarisasi volatilitas lokal' if args.standardize else 'mentah (--no-standardize)'} ===")
@@ -333,7 +337,7 @@ def run(args) -> int:
     axes[0][0].set_ylabel("% terhadap pembanding sebelum event")
     fig.suptitle(f"'{args.event}' per tahun - {', '.join(series)}")
     fig.tight_layout(); fig.savefig(out / "event_per_year.png", dpi=130); plt.close(fig)
-    print(f"\nFile: {out/'event_profile.png'}, {out/'event_per_year.png'}, {out/'occurrences.csv'}")
+    print(f"\nFile: {out/'event_profile.png'}, {out/'event_per_year.png'}, {out/'occurrences.csv'}, {out/'profil_harian.csv'}")
     return 0
 
 
